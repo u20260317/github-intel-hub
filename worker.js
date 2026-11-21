@@ -1,5 +1,5 @@
 // ============================================================
-// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试；v5.2：Telegram Bot 命令系统；v5.3：频道自动注册——Bot 被设为频道管理员后经 my_chat_member/channel_post 自动登记为推送目标；v5.3.1：手动推送接口加 PUSH_KEY 鉴权 + 节流改为按目标分别计算；v5.4：只读 GET 路由加边缘缓存——Cache API 读穿缓存 30 分钟、巡检写新数据后主动失效，重复访问不再重跑渲染/重读 KV）
+// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试；v5.2：Telegram Bot 命令系统；v5.3：频道自动注册——Bot 被设为频道管理员后经 my_chat_member/channel_post 自动登记为推送目标；v5.3.1：手动推送接口加 PUSH_KEY 鉴权 + 节流改为按目标分别计算；v5.4：只读 GET 路由加边缘缓存——Cache API 读穿缓存 30 分钟、巡检写新数据后主动失效，重复访问不再重跑渲染/重读 KV；v5.5：面板与 /api/brief 八语种 i18n（zh/en/ru/uk/ja/ko/es/ar）——仅 UI 层本地化（语言解析?lang= > Cookie > Accept-Language > zh），标签/研判渲染时翻译，存储数据与 Telegram 推送保持中文，边缘缓存键按语言分开、巡检失效全部语言变体）
 // 单文件 Cloudflare Worker：定时巡检 GitHub 热门仓库，做规则研判（热度/学习点/评级），
 // 以「黑客情报中心」风格暗色面板呈现。零依赖，数据存 KV（绑定名 INTEL_KV）。
 // 研判为规则引擎产出，非 AI 生成，面板与代码均如实标注「规则研判」。
@@ -483,7 +483,10 @@ else if (typeof rec.starDelta === "number" && rec.starDelta < 0) head = `本轮�
 else if (typeof rec.starDelta === "number") head = "本轮星标持平，";
 else head = "新入情报库，";
 const verdict = `${head}${rec.language? rec.language + " ": ""}${point}项目，值得看它的${point}。`;
-return { heat, grade, learnTags: tags, verdict};
+// 【v5.5】同时存结构化研判部件：非中文界面在渲染时按语言用 verdictParts 重新拼句（point 存中文标签原文，渲染时走 tagLabel 翻译）；
+// verdict 中文成品句保持不变，供 zh 界面与 Telegram 推送原样使用。旧记录没有 verdictParts，非 zh 渲染时走 renderVerdict 的通用兜底。
+const verdictParts = { delta: typeof rec.starDelta === "number"? rec.starDelta: null, language: rec.language || "", point};
+return { heat, grade, learnTags: tags, verdict, verdictParts};
 }
 
 // ============================================================
@@ -504,9 +507,1067 @@ catch { return iso;}
 }
 
 // ============================================================
+// 【核心模块】多语言 i18n（v5.5）— 面板与 /api/brief 的 UI 层八语种：zh（默认）/ en / ru / uk / ja / ko / es / ar。
+// 只翻译 UI 外壳：存储数据（仓库记录、标签原文、种子笔记）与 Telegram 推送/命令保持中文，标签与一句话研判在渲染时按语言翻译/拼装。
+// 语言解析顺序：?lang=（合法值才算）> Cookie intel-lang > Accept-Language 首项（匹配基础语言，含 en-US/zh-CN 等地区变体）> zh。
+// ============================================================
+const LANGS = ["zh", "en", "ru", "uk", "ja", "ko", "es", "ar"];
+const LANG_LOCALES = { zh: "zh-CN", en: "en-US", ru: "ru-RU", uk: "uk-UA", ja: "ja-JP", ko: "ko-KR", es: "es-ES", ar: "ar-EG"};
+const LANG_HTML = { zh: "zh-CN", en: "en", ru: "ru", uk: "uk", ja: "ja", ko: "ko", es: "es", ar: "ar"};
+const LANG_SHORT = { zh: "中文", en: "EN", ru: "RU", uk: "UK", ja: "JA", ko: "KO", es: "ES", ar: "ع"};
+
+const STRINGS = {
+zh: {
+doc_title: "GitHub 情报中心 · INTEL CENTER",
+h1: "◢ GitHub 情报中心",
+tagline: "GITHUB INTEL CENTER // 开源情报巡检 · 规则研判 · 非 AI 生成",
+clock_label: "北京时间 CST",
+status_label: "巡检状态：",
+status_ok: "✅ 正常",
+status_warn: "⚠️ 异常",
+status_none: "尚无数据",
+channels_part: " · 通道 {ok}/{total}",
+toggle_collapse: "收起工具栏 ▴",
+toggle_expand: "展开工具栏 ▾",
+tagcloud_label: "🏷 热门标签（点标签筛选全部情报）",
+tagcloud_empty: "暂无标签数据",
+trend_label: "📈 话题趋势",
+trend_fmt: "+{d}★/24h · 连续 {n} 轮升温",
+filter_all: "全部",
+grade_all: "评级 全部",
+grade_btn_fmt: "{g} 级",
+grade_card_fmt: "{g}级",
+search_ph: "🔍 搜仓库名 / 描述 / 语言",
+pill_label: "标签：",
+pill_clear: "✕ 清除标签",
+expand_all: "全部展开",
+collapse_all: "全部收起",
+ticker_full: "上次巡检 {ts} · 监控仓库 {n} 个 · 本轮新增 {new} · 通道正常 {ok}/{total}",
+ticker_err: " · 异常通道：{list}",
+ticker_src: " · 数据源 GitHub Search API（未认证限额较低） · 研判为规则引擎产出",
+ticker_none: "尚无巡检数据 · 点击「立即巡检」或 POST /api/refresh 拉取第一批情报",
+kpi_repos: "监控仓库数",
+kpi_new: "本轮新增",
+kpi_heat: "最高热度",
+kpi_channels: "情报通道数",
+kpi_seeds: "重点监控种子",
+kpi_last: "上次巡检 (CST)",
+refresh_btn: "↻ 立即巡检（30 分钟节流）",
+empty_text: "▣ 情报库为空。先执行一次巡检：点下方按钮，或 <code>POST /api/refresh</code>。未认证 GitHub API 每小时搜索限额有限，请勿频繁刷新（面板刷新有 30 分钟节流）。",
+empty_btn: "立即巡检",
+overview_title: "◢ 情报总览 INTEL OVERVIEW",
+overview_para: "本面板追踪 GitHub 热门仓库：飙升榜按本轮星标增量排序（需至少两轮巡检才有增量），其余按热度分排序。热度分 = 星标规模 + 本轮增量 + 推送新鲜度 + fork 活跃度的规则加权；学习点为关键词规则映射；评级 S ≥70、A ≥45、B 其余。",
+sec_surge: "◢ 飙升榜 STAR SURGE",
+sec_newstars: "◢ 热门新星 NEW STARS",
+sec_ai: "◢ AI / AGENT 专区",
+sec_security: "◢ 网安 · 红队 · SRC 情报 SECURITY INTEL",
+sec_src: "◢ SRC · 挖洞 SRC HUNTING",
+sec_seclearn: "◢ 网安学习资料 SECURITY LEARNING",
+sec_skills: "◢ Skill 生态 SKILL ECOSYSTEM",
+sec_creator: "◢ 自媒体全套 CREATOR TOOLKIT",
+sec_watchlist: "◢ 重点监控 WATCHLIST",
+sec_all: "◢ 全部情报 ALL INTEL",
+nodata: "暂无数据",
+show_more: "展开全部 {n} 条 ▾",
+show_less: "收起 ▴",
+watchlist_para: "人工精选种子清单（已预筛）：Skill 生态 / 写作 / 科研 / 自媒体 / 网安五类。种子若被本轮巡检命中，卡片会带其实时 ★、热度与本轮增量；未命中的种子由巡检按游标轮换「单独保鲜」（每轮最多 3 个，卡片标注保鲜时间），保鲜时发现改名会显示当前名、404 会标注疑似删库；都还没轮到的标注「点名监控中」。种子学习点为人工研判，与规则研判区分。",
+all_foot: "数据源：GitHub Search API（公开接口，未认证时限额约 10 次/分钟、每小时搜索配额有限；配置 GITHUB_TOKEN 可提高）。星标增量需至少两轮巡检对比快照得出，第一轮均为「新入情报库」。本站研判均为规则引擎产出，重点监控种子的学习点为人工撰写，均不构成推荐结论。",
+pager_prev: "← 上一页",
+pager_next: "下一页 →",
+brief_fab: "📋 总统简报",
+brief_head: "📋 总统简报 · DAILY BRIEF",
+brief_min: "最小化",
+brief_close: "关闭",
+brief_foot: "生成于 {time} CST · 规则引擎（非 AI 生成）",
+js_refreshing: "巡检中…（约需数秒）",
+js_throttled: "已节流：距上次巡检不足 30 分钟，稍后再试。",
+js_fail: "巡检失败：",
+js_pager: "第 {cur} / {pages} 页 · 共 {total} 条（筛选后）",
+js_shown: " 当前显示 {n} 个",
+no_desc: "（无描述）",
+delta_fmt: "{sd}★ 本轮",
+heat_line: "热度 {heat} / 100 · 推送 {date}",
+verdict_prefix: "研判（规则）：",
+tag_title: "按此标签筛选全部情报",
+seed_note: "学习点：",
+seed_live: "★ {stars} · 热度 {heat} · {grade}",
+seed_refreshed: "单独保鲜",
+seed_renamed: "原 {name} 已改名",
+seed_gone: "⚠️ 疑似删库/改名未追踪（保鲜检查 {ts}）",
+seed_static: "未在本轮巡检命中 · 点名监控中",
+seed_group_fmt: "▸ {cat}（{n}）",
+brief_situation: "【今日态势】",
+brief_surge_t: "【飙升 TOP3】",
+brief_heat_t: "【热度 TOP3】",
+brief_sec_t: "【网安焦点】",
+brief_skill_t: "【Skill 焦点】",
+brief_wl_t: "【重点监控动态】",
+brief_trend_t: "【话题趋势】",
+brief_rename_t: "【改名动态】",
+brief_nodata_delta: "暂无增量数据（需两轮巡检）",
+brief_no_sec: "暂无网安焦点",
+brief_no_skill: "暂无 Skill 焦点",
+brief_meta: "★ {stars} · 热度 {heat}",
+brief_delta: " · {sd}★ 本轮",
+brief_hot_tags: "热门标签：",
+brief_wl_line: "已命中实时数据 <b>{live}</b> / {total} 个种子",
+brief_wl_top: "领跑种子：",
+brief_topics_label: "关键词热度：",
+brief_topic_item: "{topic}（{count} 仓 · ★{stars}）",
+brief_rename_line: "改名动态：{from} → ",
+oneliner_empty: "情报库尚无数据，执行一次巡检后生成今日态势。",
+oneliner_p1: "今日共监控 {n} 个仓库，本轮新增 {new} 个，巡检通道 {ok}/{total} 正常。",
+oneliner_surge: "飙升最快的是 {name}（本轮 +{d}★）。",
+oneliner_heat: "热度榜首为 {name}（热度 {heat}）。",
+oneliner_sec: "网安焦点为 {name}",
+oneliner_sec_tags: "，热门安全标签：{tags}",
+oneliner_end: "。",
+verdict_up: "近一轮 +{d}★，",
+verdict_down: "本轮回落 {d}★，",
+verdict_flat: "本轮星标持平，",
+verdict_new: "新入情报库，",
+verdict_body: "{point}项目，值得看它的{point}。",
+verdict_generic: "热度 {heat}，主要看点：{tag}。",
+tag_practice_suffix: "工程实践",
+kv_err_title: "配置错误",
+kv_err_h1: "◢ 配置错误",
+kv_err_body: "KV 未绑定：请给本 Worker 绑定 KV namespace，变量名必须为 <b>INTEL_KV</b>，然后重新部署。",
+},
+en: {
+doc_title: "GitHub Intel Center",
+h1: "◢ GitHub Intel Center",
+tagline: "GITHUB INTEL CENTER // Open-Source Intel Sweeps · Rule-Based Analysis · Not AI-Generated",
+clock_label: "Beijing Time CST",
+status_label: "Sweep status: ",
+status_ok: "✅ OK",
+status_warn: "⚠️ Error",
+status_none: "No data yet",
+channels_part: " · Channels {ok}/{total}",
+toggle_collapse: "Collapse toolbar ▴",
+toggle_expand: "Expand toolbar ▾",
+tagcloud_label: "🏷 Hot tags (click a tag to filter all intel)",
+tagcloud_empty: "No tag data yet",
+trend_label: "📈 Topic trends",
+trend_fmt: "+{d}★/24h · rising {n} rounds in a row",
+filter_all: "All",
+grade_all: "Grade: All",
+grade_btn_fmt: "Tier {g}",
+grade_card_fmt: "Tier {g}",
+search_ph: "🔍 Search repos / descriptions / languages",
+pill_label: "Tag: ",
+pill_clear: "✕ Clear tag",
+expand_all: "Expand all",
+collapse_all: "Collapse all",
+ticker_full: "Last sweep {ts} · {n} repos tracked · {new} new this round · Channels OK {ok}/{total}",
+ticker_err: " · Failed channels: {list}",
+ticker_src: " · Source: GitHub Search API (low unauthenticated limits) · Analysis by rule engine",
+ticker_none: "No sweep data yet · Click 'Sweep now' or POST /api/refresh to pull the first intel",
+kpi_repos: "Repos Tracked",
+kpi_new: "New This Round",
+kpi_heat: "Top Heat",
+kpi_channels: "Intel Channels",
+kpi_seeds: "Watchlist Seeds",
+kpi_last: "Last Sweep (CST)",
+refresh_btn: "↻ Sweep now (30-min throttle)",
+empty_text: "▣ The intel store is empty. Run a sweep first: the button below, or <code>POST /api/refresh</code>. The unauthenticated GitHub API has a limited hourly search quota — do not refresh often (manual panel refresh is throttled to 30 minutes).",
+empty_btn: "Sweep now",
+overview_title: "◢ INTEL OVERVIEW",
+overview_para: "This panel tracks trending GitHub repositories: the surge board is sorted by this round's star growth (needs at least two sweeps), everything else by heat score. Heat = a rule-weighted mix of star scale + this round's growth + push recency + fork activity; learning points are keyword rule mappings; grades: S ≥70, A ≥45, B otherwise.",
+sec_surge: "◢ STAR SURGE",
+sec_newstars: "◢ NEW STARS",
+sec_ai: "◢ AI / AGENT ZONE",
+sec_security: "◢ SECURITY INTEL",
+sec_src: "◢ SRC HUNTING",
+sec_seclearn: "◢ SECURITY LEARNING",
+sec_skills: "◢ SKILL ECOSYSTEM",
+sec_creator: "◢ CREATOR TOOLKIT",
+sec_watchlist: "◢ WATCHLIST",
+sec_all: "◢ ALL INTEL",
+nodata: "No data",
+show_more: "Show all {n} ▾",
+show_less: "Collapse ▴",
+watchlist_para: "Hand-picked seed list (pre-screened) in five groups: Skills / Writing / Research / Creator / Security. If a seed is hit by this round's sweep, its card shows live ★, heat and this round's growth; unhit seeds are refreshed in rotation by cursor ('individually refreshed', max 3 per round, the card shows the refresh time); a rename found during refresh shows the current name, a 404 is marked as possibly deleted; seeds not yet reached are marked 'named monitoring'. Seed learning points are human-written analysis, distinct from rule-based verdicts.",
+all_foot: "Source: GitHub Search API (public; unauthenticated limits are about 10 searches/min with an hourly quota — set GITHUB_TOKEN to raise them). Star growth needs at least two sweeps compared against snapshots; in the first round everything is 'new to the intel store'. All verdicts on this site are produced by a rule engine; watchlist seed learning points are human-written; neither constitutes a recommendation.",
+pager_prev: "← Prev",
+pager_next: "Next →",
+brief_fab: "📋 Daily Brief",
+brief_head: "📋 PRESIDENTIAL BRIEFING",
+brief_min: "Minimize",
+brief_close: "Close",
+brief_foot: "Generated at {time} CST · Rule engine (not AI-generated)",
+js_refreshing: "Sweeping… (takes a few seconds)",
+js_throttled: "Throttled: less than 30 minutes since the last sweep — try again later.",
+js_fail: "Sweep failed: ",
+js_pager: "Page {cur} / {pages} · {total} items (filtered)",
+js_shown: " · showing {n}",
+no_desc: "(no description)",
+delta_fmt: "{sd}★ this round",
+heat_line: "Heat {heat} / 100 · Pushed {date}",
+verdict_prefix: "Verdict (rules): ",
+tag_title: "Filter all intel by this tag",
+seed_note: "Learning point: ",
+seed_live: "★ {stars} · Heat {heat} · {grade}",
+seed_refreshed: "Individually refreshed",
+seed_renamed: "formerly {name}, renamed",
+seed_gone: "⚠️ Possibly deleted / untracked rename (refresh check {ts})",
+seed_static: "Not hit by this round's sweep · Named monitoring",
+seed_group_fmt: "▸ {cat} ({n})",
+brief_situation: "[Today's Situation]",
+brief_surge_t: "[Surge TOP 3]",
+brief_heat_t: "[Heat TOP 3]",
+brief_sec_t: "[Security Focus]",
+brief_skill_t: "[Skill Focus]",
+brief_wl_t: "[Watchlist Activity]",
+brief_trend_t: "[Trending Topics]",
+brief_rename_t: "[Renames]",
+brief_nodata_delta: "No growth data yet (needs two sweeps)",
+brief_no_sec: "No security focus yet",
+brief_no_skill: "No Skill focus yet",
+brief_meta: "★ {stars} · Heat {heat}",
+brief_delta: " · {sd}★ this round",
+brief_hot_tags: "Hot tags: ",
+brief_wl_line: "Live data for <b>{live}</b> / {total} seeds",
+brief_wl_top: "Top seed: ",
+brief_topics_label: "Keyword heat: ",
+brief_topic_item: "{topic} ({count} repos · ★{stars})",
+brief_rename_line: "Renamed: {from} → ",
+oneliner_empty: "The intel store is empty; run a sweep to generate today's situation.",
+oneliner_p1: "Tracking {n} repos today, {new} new this round, sweep channels {ok}/{total} OK. ",
+oneliner_surge: "Fastest riser: {name} (+{d}★ this round). ",
+oneliner_heat: "Heat leader: {name} (heat {heat}). ",
+oneliner_sec: "Security focus: {name}",
+oneliner_sec_tags: "; hot security tags: {tags}",
+oneliner_end: ".",
+verdict_up: "Up +{d}★ last round, ",
+verdict_down: "Down {d}★ this round, ",
+verdict_flat: "Stars flat this round, ",
+verdict_new: "New to the intel store, ",
+verdict_body: "{point} project — worth studying its {point}.",
+verdict_generic: "heat {heat}; key angle: {tag}.",
+tag_practice_suffix: "engineering practices",
+kv_err_title: "Configuration Error",
+kv_err_h1: "◢ Configuration Error",
+kv_err_body: "KV is not bound: bind a KV namespace to this Worker with the variable name <b>INTEL_KV</b>, then redeploy.",
+},
+ru: {
+doc_title: "GitHub Intel Center",
+h1: "◢ Центр разведки GitHub",
+tagline: "GITHUB INTEL CENTER // Мониторинг открытого кода · Анализ по правилам · Не сгенерировано ИИ",
+clock_label: "Пекинское время CST",
+status_label: "Статус обхода: ",
+status_ok: "✅ Норма",
+status_warn: "⚠️ Сбой",
+status_none: "Нет данных",
+channels_part: " · Каналы {ok}/{total}",
+toggle_collapse: "Свернуть панель ▴",
+toggle_expand: "Развернуть панель ▾",
+tagcloud_label: "🏷 Популярные теги (клик — фильтр всей разведки)",
+tagcloud_empty: "Нет данных тегов",
+trend_label: "📈 Тренды тем",
+trend_fmt: "+{d}★/24ч · рост {n} раунда подряд",
+filter_all: "Все",
+grade_all: "Оценка: все",
+grade_btn_fmt: "Ранг {g}",
+grade_card_fmt: "Ранг {g}",
+search_ph: "🔍 Поиск по репозиториям / описаниям / языкам",
+pill_label: "Тег: ",
+pill_clear: "✕ Сбросить тег",
+expand_all: "Развернуть всё",
+collapse_all: "Свернуть всё",
+ticker_full: "Последний обход {ts} · Отслеживается репозиториев: {n} · Новых в этом раунде: {new} · Каналы в норме {ok}/{total}",
+ticker_err: " · Сбойные каналы: {list}",
+ticker_src: " · Источник: GitHub Search API (низкие лимиты без аутентификации) · Анализ — движок правил",
+ticker_none: "Данных обхода пока нет · Нажмите «Обход сейчас» или POST /api/refresh для первой разведки",
+kpi_repos: "Репозиториев под наблюдением",
+kpi_new: "Новых в раунде",
+kpi_heat: "Макс. нагрев",
+kpi_channels: "Каналов разведки",
+kpi_seeds: "Семян в watchlist",
+kpi_last: "Последний обход (CST)",
+refresh_btn: "↻ Обход сейчас (троттлинг 30 мин)",
+empty_text: "▣ База разведки пуста. Сначала выполните обход: кнопка ниже или <code>POST /api/refresh</code>. У неаутентифицированного GitHub API ограниченная часовая квота поиска — не обновляйте часто (ручное обновление панели троттлится на 30 минут).",
+empty_btn: "Обход сейчас",
+overview_title: "◢ ОБЗОР РАЗВЕДКИ",
+overview_para: "Панель отслеживает популярные репозитории GitHub: доска роста сортируется по приросту звёзд за раунд (нужно минимум два обхода), остальное — по баллу нагрева. Нагрев = взвешенная правилами смесь масштаба звёзд + прироста за раунд + свежести пушей + активности форков; учебные точки — сопоставление по ключевым словам; оценки: S ≥70, A ≥45, B — остальные.",
+sec_surge: "◢ ДОСКА РОСТА",
+sec_newstars: "◢ НОВЫЕ ЗВЁЗДЫ",
+sec_ai: "◢ ЗОНА AI / AGENT",
+sec_security: "◢ РАЗВЕДКА БЕЗОПАСНОСТИ",
+sec_src: "◢ ОХОТА SRC",
+sec_seclearn: "◢ ОБУЧЕНИЕ БЕЗОПАСНОСТИ",
+sec_skills: "◢ ЭКОСИСТЕМА SKILL",
+sec_creator: "◢ ИНСТРУМЕНТЫ АВТОРА",
+sec_watchlist: "◢ WATCHLIST",
+sec_all: "◢ ВСЯ РАЗВЕДКА",
+nodata: "Нет данных",
+show_more: "Показать все {n} ▾",
+show_less: "Свернуть ▴",
+watchlist_para: "Ручной список семян (предварительно отобран) из пяти групп: Skill / Письмо / Наука / Авторство / Безопасность. Если семя попало в текущий обход, на карточке живые ★, нагрев и прирост за раунд; непопавшие семена освежаются по курсору по очереди («отдельное освежение», не более 3 за раунд, на карточке время освежения); переименование при освежении показывает текущее имя, 404 помечается как возможное удаление; до кого очередь не дошла — «именной мониторинг». Учебные точки семян написаны человеком и отличаются от вердиктов по правилам.",
+all_foot: "Источник: GitHub Search API (публичный; лимиты без аутентификации ≈10 поисков/мин и часовая квота — задайте GITHUB_TOKEN, чтобы поднять). Прирост звёзд требует минимум двух обходов со сравнением снимков; в первом раунде всё — «новое в базе». Все вердикты здесь выдаёт движок правил; учебные точки семян написаны человеком; ни то ни другое не является рекомендацией.",
+pager_prev: "← Назад",
+pager_next: "Вперёд →",
+brief_fab: "📋 Президентский брифинг",
+brief_head: "📋 ПРЕЗИДЕНТСКИЙ БРИФИНГ",
+brief_min: "Свернуть",
+brief_close: "Закрыть",
+brief_foot: "Сформировано в {time} CST · Движок правил (не ИИ)",
+js_refreshing: "Обход… (несколько секунд)",
+js_throttled: "Троттлинг: с прошлого обхода прошло менее 30 минут, попробуйте позже.",
+js_fail: "Обход не удался: ",
+js_pager: "Страница {cur} / {pages} · всего {total} (после фильтра)",
+js_shown: " · показано {n}",
+no_desc: "(без описания)",
+delta_fmt: "{sd}★ за раунд",
+heat_line: "Нагрев {heat} / 100 · Пуш {date}",
+verdict_prefix: "Вердикт (правила): ",
+tag_title: "Фильтровать всю разведку по этому тегу",
+seed_note: "Учебная точка: ",
+seed_live: "★ {stars} · Нагрев {heat} · {grade}",
+seed_refreshed: "Отдельное освежение",
+seed_renamed: "ранее {name}, переименовано",
+seed_gone: "⚠️ Возможно удалён / переименование не отслежено (проверка освежения {ts})",
+seed_static: "Не попало в этот обход · Именной мониторинг",
+seed_group_fmt: "▸ {cat} ({n})",
+brief_situation: "【Обстановка за день】",
+brief_surge_t: "【ТОП-3 роста】",
+brief_heat_t: "【ТОП-3 по теплу】",
+brief_sec_t: "【Фокус: безопасность】",
+brief_skill_t: "【Фокус: Skills】",
+brief_wl_t: "【Динамика наблюдения】",
+brief_trend_t: "【Тренды тем】",
+brief_rename_t: "【Переименования】",
+brief_nodata_delta: "Нет данных о приросте (нужны два обхода)",
+brief_no_sec: "Нет фокуса безопасности",
+brief_no_skill: "Нет фокуса Skill",
+brief_meta: "★ {stars} · Нагрев {heat}",
+brief_delta: " · {sd}★ за раунд",
+brief_hot_tags: "Популярные теги: ",
+brief_wl_line: "Живые данные по <b>{live}</b> / {total} семенам",
+brief_wl_top: "Ведущее семя: ",
+brief_topics_label: "Нагрев ключевых слов: ",
+brief_topic_item: "{topic} ({count} реп. · ★{stars})",
+brief_rename_line: "Переименовано: {from} → ",
+oneliner_empty: "База разведки пуста; выполните обход, чтобы сформировать обстановку дня.",
+oneliner_p1: "Сегодня под наблюдением {n} репозиториев, новых в раунде: {new}, каналы обхода в норме {ok}/{total}. ",
+oneliner_surge: "Быстрее всех растёт {name} (+{d}★ за раунд). ",
+oneliner_heat: "Лидер нагрева — {name} (нагрев {heat}). ",
+oneliner_sec: "Фокус безопасности — {name}",
+oneliner_sec_tags: "; популярные теги безопасности: {tags}",
+oneliner_end: ".",
+verdict_up: "За раунд +{d}★, ",
+verdict_down: "За раунд {d}★, ",
+verdict_flat: "Звёзды за раунд без изменений, ",
+verdict_new: "Новое в базе, ",
+verdict_body: "проект по теме «{point}»; стоит посмотреть его реализацию.",
+verdict_generic: "нагрев {heat}; ключевая тема: {tag}.",
+tag_practice_suffix: "инженерная практика",
+kv_err_title: "Ошибка конфигурации",
+kv_err_h1: "◢ Ошибка конфигурации",
+kv_err_body: "KV не привязан: привяжите к этому Worker пространство KV с именем переменной <b>INTEL_KV</b> и передеплойте.",
+},
+uk: {
+doc_title: "GitHub Intel Center",
+h1: "◢ Центр розвідки GitHub",
+tagline: "GITHUB INTEL CENTER // Моніторинг відкритого коду · Аналіз за правилами · Не згенеровано ШІ",
+clock_label: "Пекінський час CST",
+status_label: "Статус обходу: ",
+status_ok: "✅ Норма",
+status_warn: "⚠️ Збій",
+status_none: "Немає даних",
+channels_part: " · Канали {ok}/{total}",
+toggle_collapse: "Згорнути панель ▴",
+toggle_expand: "Розгорнути панель ▾",
+tagcloud_label: "🏷 Популярні теги (клік — фільтр усієї розвідки)",
+tagcloud_empty: "Немає даних тегів",
+trend_label: "📈 Тренди тем",
+trend_fmt: "+{d}★/24год · зростання {n} раунди поспіль",
+filter_all: "Усі",
+grade_all: "Оцінка: усі",
+grade_btn_fmt: "Ранг {g}",
+grade_card_fmt: "Ранг {g}",
+search_ph: "🔍 Пошук за репозиторіями / описами / мовами",
+pill_label: "Тег: ",
+pill_clear: "✕ Скинути тег",
+expand_all: "Розгорнути все",
+collapse_all: "Згорнути все",
+ticker_full: "Останній обхід {ts} · Відстежується репозиторіїв: {n} · Нових у цьому раунді: {new} · Канали в нормі {ok}/{total}",
+ticker_err: " · Збійні канали: {list}",
+ticker_src: " · Джерело: GitHub Search API (низькі ліміти без автентифікації) · Аналіз — рушій правил",
+ticker_none: "Даних обходу ще немає · Натисніть «Обхід зараз» або POST /api/refresh для першої розвідки",
+kpi_repos: "Репозиторіїв під наглядом",
+kpi_new: "Нових у раунді",
+kpi_heat: "Макс. нагрів",
+kpi_channels: "Каналів розвідки",
+kpi_seeds: "Насінин у watchlist",
+kpi_last: "Останній обхід (CST)",
+refresh_btn: "↻ Обхід зараз (тротлінг 30 хв)",
+empty_text: "▣ База розвідки порожня. Спершу виконайте обхід: кнопка нижче або <code>POST /api/refresh</code>. У неавтентифікованого GitHub API обмежена годинна квота пошуку — не оновлюйте часто (ручне оновлення панелі тротлиться на 30 хвилин).",
+empty_btn: "Обхід зараз",
+overview_title: "◢ ОГЛЯД РОЗВІДКИ",
+overview_para: "Панель відстежує популярні репозиторії GitHub: дошка зростання сортується за приростом зірок за раунд (потрібно щонайменше два обходи), решта — за балом нагріву. Нагрів = зважена правилами суміш масштабу зірок + приросту за раунд + свіжості пушів + активності форків; навчальні точки — зіставлення за ключовими словами; оцінки: S ≥70, A ≥45, B — решта.",
+sec_surge: "◢ ДОШКА ЗРОСТАННЯ",
+sec_newstars: "◢ НОВІ ЗІРКИ",
+sec_ai: "◢ ЗОНА AI / AGENT",
+sec_security: "◢ РОЗВІДКА БЕЗПЕКИ",
+sec_src: "◢ ПОЛЮВАННЯ SRC",
+sec_seclearn: "◢ НАВЧАННЯ БЕЗПЕКИ",
+sec_skills: "◢ ЕКОСИСТЕМА SKILL",
+sec_creator: "◢ ІНСТРУМЕНТИ АВТОРА",
+sec_watchlist: "◢ WATCHLIST",
+sec_all: "◢ УСЯ РОЗВІДКА",
+nodata: "Немає даних",
+show_more: "Показати всі {n} ▾",
+show_less: "Згорнути ▴",
+watchlist_para: "Ручний список насінин (попередньо відібраний) із п'яти груп: Skill / Письмо / Наука / Авторство / Безпека. Якщо насінина потрапила в поточний обхід, на картці живі ★, нагрів і приріст за раунд; ті, що не потрапили, освіжаються за курсором по черзі («окреме освіження», не більше 3 за раунд, на картці час освіження); перейменування під час освіження показує поточне ім'я, 404 позначається як можливе видалення; до кого черга не дійшла — «іменний моніторинг». Навчальні точки насінин написані людиною й відрізняються від вердиктів за правилами.",
+all_foot: "Джерело: GitHub Search API (публічний; ліміти без автентифікації ≈10 пошуків/хв і годинна квота — задайте GITHUB_TOKEN, щоб підняти). Приріст зірок потребує щонайменше двох обходів із порівнянням знімків; у першому раунді все — «нове в базі». Усі вердикти тут видає рушій правил; навчальні точки насінин написані людиною; ані те, ані інше не є рекомендацією.",
+pager_prev: "← Назад",
+pager_next: "Вперед →",
+brief_fab: "📋 Президентський брифінг",
+brief_head: "📋 ПРЕЗИДЕНТСЬКИЙ БРИФІНГ",
+brief_min: "Згорнути",
+brief_close: "Закрити",
+brief_foot: "Сформовано о {time} CST · Рушій правил (не ШІ)",
+js_refreshing: "Обхід… (кілька секунд)",
+js_throttled: "Троттлінг: від минулого обходу минуло менше 30 хвилин, спробуйте пізніше.",
+js_fail: "Обхід не вдався: ",
+js_pager: "Сторінка {cur} / {pages} · усього {total} (після фільтра)",
+js_shown: " · показано {n}",
+no_desc: "(без опису)",
+delta_fmt: "{sd}★ за раунд",
+heat_line: "Нагрів {heat} / 100 · Пуш {date}",
+verdict_prefix: "Вердикт (правила): ",
+tag_title: "Фільтрувати всю розвідку за цим тегом",
+seed_note: "Навчальна точка: ",
+seed_live: "★ {stars} · Нагрів {heat} · {grade}",
+seed_refreshed: "Окреме освіження",
+seed_renamed: "раніше {name}, перейменовано",
+seed_gone: "⚠️ Можливо видалено / перейменування не відстежено (перевірка освіження {ts})",
+seed_static: "Не потрапило в цей обхід · Іменний моніторинг",
+seed_group_fmt: "▸ {cat} ({n})",
+brief_situation: "【Становище за день】",
+brief_surge_t: "【ТОП-3 зростання】",
+brief_heat_t: "【ТОП-3 за теплом】",
+brief_sec_t: "【Фокус: безпека】",
+brief_skill_t: "【Фокус: Skills】",
+brief_wl_t: "【Динаміка спостереження】",
+brief_trend_t: "【Тренди тем】",
+brief_rename_t: "【Перейменування】",
+brief_nodata_delta: "Немає даних про приріст (потрібні два обходи)",
+brief_no_sec: "Немає фокуса безпеки",
+brief_no_skill: "Немає фокуса Skill",
+brief_meta: "★ {stars} · Нагрів {heat}",
+brief_delta: " · {sd}★ за раунд",
+brief_hot_tags: "Популярні теги: ",
+brief_wl_line: "Живі дані щодо <b>{live}</b> / {total} насінин",
+brief_wl_top: "Провідна насінина: ",
+brief_topics_label: "Нагрів ключових слів: ",
+brief_topic_item: "{topic} ({count} реп. · ★{stars})",
+brief_rename_line: "Перейменовано: {from} → ",
+oneliner_empty: "База розвідки порожня; виконайте обхід, щоб сформувати обстановку дня.",
+oneliner_p1: "Сьогодні під наглядом {n} репозиторіїв, нових у раунді: {new}, канали обходу в нормі {ok}/{total}. ",
+oneliner_surge: "Найшвидше зростає {name} (+{d}★ за раунд). ",
+oneliner_heat: "Лідер нагріву — {name} (нагрів {heat}). ",
+oneliner_sec: "Фокус безпеки — {name}",
+oneliner_sec_tags: "; популярні теги безпеки: {tags}",
+oneliner_end: ".",
+verdict_up: "За раунд +{d}★, ",
+verdict_down: "За раунд {d}★, ",
+verdict_flat: "Зірки за раунд без змін, ",
+verdict_new: "Нове в базі, ",
+verdict_body: "проєкт за темою «{point}»; варто подивитися його реалізацію.",
+verdict_generic: "нагрів {heat}; ключова тема: {tag}.",
+tag_practice_suffix: "інженерна практика",
+kv_err_title: "Помилка конфігурації",
+kv_err_h1: "◢ Помилка конфігурації",
+kv_err_body: "KV не прив'язано: прив'яжіть до цього Worker простір KV з іменем змінної <b>INTEL_KV</b> і передеплойте.",
+},
+ja: {
+doc_title: "GitHub インテルセンター",
+h1: "◢ GitHub 情報センター",
+tagline: "GITHUB INTEL CENTER // オープンソース情報巡回 · ルール研判 · AI生成ではない",
+clock_label: "北京時間 CST",
+status_label: "巡回ステータス：",
+status_ok: "✅ 正常",
+status_warn: "⚠️ 異常",
+status_none: "データなし",
+channels_part: " · チャンネル {ok}/{total}",
+toggle_collapse: "ツールバーを閉じる ▴",
+toggle_expand: "ツールバーを開く ▾",
+tagcloud_label: "🏷 人気タグ（クリックで全情報を絞り込み）",
+tagcloud_empty: "タグデータなし",
+trend_label: "📈 トピック動向",
+trend_fmt: "+{d}★/24h · {n} ラウンド連続上昇",
+filter_all: "すべて",
+grade_all: "評価 すべて",
+grade_btn_fmt: "{g} ランク",
+grade_card_fmt: "{g}ランク",
+search_ph: "🔍 リポジトリ名 / 説明 / 言語で検索",
+pill_label: "タグ：",
+pill_clear: "✕ タグを解除",
+expand_all: "すべて展開",
+collapse_all: "すべて折りたたむ",
+ticker_full: "前回巡回 {ts} · 監視リポジトリ {n} 件 · 今回新規 {new} 件 · チャンネル正常 {ok}/{total}",
+ticker_err: " · 異常チャンネル：{list}",
+ticker_src: " · データ元 GitHub Search API（未認証は上限低め） · 研判はルールエンジン産出",
+ticker_none: "巡回データなし · 「今すぐ巡回」または POST /api/refresh で最初の情報を取得",
+kpi_repos: "監視リポジトリ数",
+kpi_new: "今回の新規",
+kpi_heat: "最高熱度",
+kpi_channels: "情報チャンネル数",
+kpi_seeds: "重点監視シード",
+kpi_last: "前回巡回 (CST)",
+refresh_btn: "↻ 今すぐ巡回（30分スロットル）",
+empty_text: "▣ 情報庫は空です。まず巡回を実行してください：下のボタン、または <code>POST /api/refresh</code>。未認証 GitHub API は1時間あたりの検索上限が限られるため、頻繁に更新しないでください（パネルの手動更新は30分スロットル）。",
+empty_btn: "今すぐ巡回",
+overview_title: "◢ 情報総覧 INTEL OVERVIEW",
+overview_para: "本パネルは GitHub の人気リポジトリを追跡します：急上昇榜は今回のスター増分順（増分には最低2回の巡回が必要）、その他は熱度スコア順。熱度 = スター規模 + 今回増分 + プッシュ新鮮度 + fork 活発度のルール加重；学習ポイントはキーワードルールのマッピング；評価は S ≥70、A ≥45、B その他。",
+sec_surge: "◢ 急上昇榜 STAR SURGE",
+sec_newstars: "◢ 人気新星 NEW STARS",
+sec_ai: "◢ AI / AGENT ゾーン",
+sec_security: "◢ セキュリティ情報 SECURITY INTEL",
+sec_src: "◢ SRC ハンティング SRC HUNTING",
+sec_seclearn: "◢ セキュリティ学習 SECURITY LEARNING",
+sec_skills: "◢ Skill エコシステム SKILL ECOSYSTEM",
+sec_creator: "◢ クリエイターツール CREATOR TOOLKIT",
+sec_watchlist: "◢ 重点監視 WATCHLIST",
+sec_all: "◢ 全情報 ALL INTEL",
+nodata: "データなし",
+show_more: "全 {n} 件を表示 ▾",
+show_less: "折りたたむ ▴",
+watchlist_para: "人手で選んだシード一覧（事前選別済み）：Skill / 執筆 / 研究 / クリエイター / セキュリティの5分類。シードが今回の巡回にヒットすると、カードにリアルタイムの ★・熱度・今回増分が表示されます；ヒットしなかったシードはカーソルで順番に「個別リフレッシュ」（1回最大3件、カードにリフレッシュ時刻を表示）；リフレッシュで改名が見つかれば現在の名前を表示し、404 は削除の可能性として注記；まだ順番が来ていないものは「指名監視中」。シードの学習ポイントは人手による研判で、ルール研判とは区別されます。",
+all_foot: "データ元：GitHub Search API（公開インターフェース、未認証時は約10回/分＋1時間あたりの検索クォータ制限；GITHUB_TOKEN を設定すると引き上げ可能）。スター増分は最低2回の巡回でスナップショットを比較して算出され、初回はすべて「情報庫に新規」。本サイトの研判はすべてルールエンジンの産出であり、重点監視シードの学習ポイントは人手による記述で、いずれも推奨を意味しません。",
+pager_prev: "← 前へ",
+pager_next: "次へ →",
+brief_fab: "📋 大統領ブリーフィング",
+brief_head: "📋 大統領ブリーフィング · DAILY BRIEF",
+brief_min: "最小化",
+brief_close: "閉じる",
+brief_foot: "{time} CST 生成 · ルールエンジン（AI生成ではない）",
+js_refreshing: "巡回中…（数秒かかります）",
+js_throttled: "スロットル中：前回巡回から30分未満です。しばらくしてからお試しください。",
+js_fail: "巡回失敗：",
+js_pager: "{cur} / {pages} ページ · 全 {total} 件（絞り込み後）",
+js_shown: " 現在 {n} 件表示中",
+no_desc: "（説明なし）",
+delta_fmt: "{sd}★ 今回",
+heat_line: "熱度 {heat} / 100 · プッシュ {date}",
+verdict_prefix: "研判（ルール）：",
+tag_title: "このタグで全情報を絞り込む",
+seed_note: "学習ポイント：",
+seed_live: "★ {stars} · 熱度 {heat} · {grade}",
+seed_refreshed: "個別リフレッシュ",
+seed_renamed: "旧 {name} から改名",
+seed_gone: "⚠️ 削除/改名未追跡の可能性（リフレッシュ確認 {ts}）",
+seed_static: "今回の巡回に未ヒット · 指名監視中",
+seed_group_fmt: "▸ {cat}（{n}）",
+brief_situation: "【本日の情勢】",
+brief_surge_t: "【急上昇 TOP3】",
+brief_heat_t: "【熱度 TOP3】",
+brief_sec_t: "【セキュリティ焦点】",
+brief_skill_t: "【Skill 焦点】",
+brief_wl_t: "【重点監視の動向】",
+brief_trend_t: "【トピック動向】",
+brief_rename_t: "【改名動向】",
+brief_nodata_delta: "増分データなし（2回の巡回が必要）",
+brief_no_sec: "セキュリティ焦点なし",
+brief_no_skill: "Skill 焦点なし",
+brief_meta: "★ {stars} · 熱度 {heat}",
+brief_delta: " · {sd}★ 今回",
+brief_hot_tags: "人気タグ：",
+brief_wl_line: "リアルタイムデータ取得済み <b>{live}</b> / {total} シード",
+brief_wl_top: "トップシード：",
+brief_topics_label: "キーワード熱度：",
+brief_topic_item: "{topic}（{count} 件 · ★{stars}）",
+brief_rename_line: "改名：{from} → ",
+oneliner_empty: "情報庫にデータがありません。巡回を実行すると本日の情勢が生成されます。",
+oneliner_p1: "本日は {n} 件のリポジトリを監視し、今回の新規は {new} 件、巡回チャンネルは {ok}/{total} が正常です。",
+oneliner_surge: "最も急上昇しているのは {name}（今回 +{d}★）。",
+oneliner_heat: "熱度の首位は {name}（熱度 {heat}）。",
+oneliner_sec: "セキュリティの焦点は {name}",
+oneliner_sec_tags: "、人気のセキュリティタグ：{tags}",
+oneliner_end: "。",
+verdict_up: "前回 +{d}★、",
+verdict_down: "今回 {d}★ 低下、",
+verdict_flat: "今回スター変動なし、",
+verdict_new: "情報庫に新規、",
+verdict_body: "{point}のプロジェクト。その{point}の実装を見る価値あり。",
+verdict_generic: "熱度 {heat}、主な見どころ：{tag}。",
+tag_practice_suffix: "エンジニアリング実践",
+kv_err_title: "設定エラー",
+kv_err_h1: "◢ 設定エラー",
+kv_err_body: "KV がバインドされていません：この Worker に変数名 <b>INTEL_KV</b> で KV namespace をバインドし、再デプロイしてください。",
+},
+ko: {
+doc_title: "GitHub 인텔 센터",
+h1: "◢ GitHub 정보 센터",
+tagline: "GITHUB INTEL CENTER // 오픈소스 정보 순찰 · 규칙 분석 · AI 생성이 아님",
+clock_label: "베이징 시간 CST",
+status_label: "순찰 상태: ",
+status_ok: "✅ 정상",
+status_warn: "⚠️ 이상",
+status_none: "데이터 없음",
+channels_part: " · 채널 {ok}/{total}",
+toggle_collapse: "툴바 접기 ▴",
+toggle_expand: "툴바 펼치기 ▾",
+tagcloud_label: "🏷 인기 태그 (클릭하면 전체 정보 필터링)",
+tagcloud_empty: "태그 데이터 없음",
+trend_label: "📈 토픽 동향",
+trend_fmt: "+{d}★/24h · {n} 라운드 연속 상승",
+filter_all: "전체",
+grade_all: "등급 전체",
+grade_btn_fmt: "{g} 등급",
+grade_card_fmt: "{g}등급",
+search_ph: "🔍 저장소 이름 / 설명 / 언어 검색",
+pill_label: "태그: ",
+pill_clear: "✕ 태그 지우기",
+expand_all: "모두 펼치기",
+collapse_all: "모두 접기",
+ticker_full: "지난 순찰 {ts} · 모니터링 저장소 {n}개 · 이번 신규 {new}개 · 채널 정상 {ok}/{total}",
+ticker_err: " · 이상 채널: {list}",
+ticker_src: " · 데이터 출처 GitHub Search API (미인증 한도 낮음) · 분석은 규칙 엔진 산출",
+ticker_none: "순찰 데이터 없음 · '지금 순찰' 또는 POST /api/refresh 로 첫 정보를 가져오세요",
+kpi_repos: "모니터링 저장소 수",
+kpi_new: "이번 신규",
+kpi_heat: "최고 열도",
+kpi_channels: "정보 채널 수",
+kpi_seeds: "중점 모니터링 시드",
+kpi_last: "지난 순찰 (CST)",
+refresh_btn: "↻ 지금 순찰 (30분 스로틀)",
+empty_text: "▣ 정보 저장소가 비어 있습니다. 먼저 순찰을 실행하세요: 아래 버튼 또는 <code>POST /api/refresh</code>. 미인증 GitHub API는 시간당 검색 한도가 제한적이므로 자주 새로고침하지 마세요 (패널 수동 새로고침은 30분 스로틀).",
+empty_btn: "지금 순찰",
+overview_title: "◢ 정보 총람 INTEL OVERVIEW",
+overview_para: "이 패널은 GitHub 인기 저장소를 추적합니다: 급상승 보드는 이번 라운드의 스타 증분 순(증분은 최소 두 번의 순찰 필요), 나머지는 열도 점수 순입니다. 열도 = 스타 규모 + 이번 증분 + 푸시 신선도 + fork 활발도의 규칙 가중; 학습 포인트는 키워드 규칙 매핑; 등급은 S ≥70, A ≥45, B 그 외.",
+sec_surge: "◢ 급상승 보드 STAR SURGE",
+sec_newstars: "◢ 인기 신성 NEW STARS",
+sec_ai: "◢ AI / AGENT 존",
+sec_security: "◢ 보안 정보 SECURITY INTEL",
+sec_src: "◢ SRC 헌팅 SRC HUNTING",
+sec_seclearn: "◢ 보안 학습 SECURITY LEARNING",
+sec_skills: "◢ Skill 생태계 SKILL ECOSYSTEM",
+sec_creator: "◢ 크리에이터 툴킷 CREATOR TOOLKIT",
+sec_watchlist: "◢ 중점 모니터링 WATCHLIST",
+sec_all: "◢ 전체 정보 ALL INTEL",
+nodata: "데이터 없음",
+show_more: "전체 {n}개 보기 ▾",
+show_less: "접기 ▴",
+watchlist_para: "수작업으로 고른 시드 목록(사전 선별): Skill / 글쓰기 / 연구 / 크리에이터 / 보안 5개 분류. 시드가 이번 순찰에 적중하면 카드에 실시간 ★, 열도와 이번 증분이 표시됩니다; 적중하지 못한 시드는 커서로 차례로 '개별 리프레시'(라운드당 최대 3개, 카드에 리프레시 시각 표시); 리프레시에서 개명이 발견되면 현재 이름을 표시하고, 404는 삭제 가능성으로 표기; 아직 차례가 오지 않은 것은 '지명 모니터링 중'. 시드의 학습 포인트는 사람이 쓴 분석으로, 규칙 분석과 구분됩니다.",
+all_foot: "데이터 출처: GitHub Search API (공개 인터페이스, 미인증 시 약 10회/분 + 시간당 검색 쿼터 제한; GITHUB_TOKEN을 설정하면 상향 가능). 스타 증분은 최소 두 번의 순찰로 스냅샷을 비교해 산출되며, 첫 라운드에서는 모두 '정보 저장소 신규'입니다. 이 사이트의 분석은 모두 규칙 엔진 산출이며, 중점 모니터링 시드의 학습 포인트는 사람이 작성한 것으로, 어느 것도 추천을 의미하지 않습니다.",
+pager_prev: "← 이전",
+pager_next: "다음 →",
+brief_fab: "📋 대통령 브리핑",
+brief_head: "📋 대통령 브리핑 · DAILY BRIEF",
+brief_min: "최소화",
+brief_close: "닫기",
+brief_foot: "{time} CST 생성 · 규칙 엔진 (AI 생성이 아님)",
+js_refreshing: "순찰 중… (몇 초 걸립니다)",
+js_throttled: "스로틀 중: 지난 순찰로부터 30분이 지나지 않았습니다. 잠시 후 다시 시도하세요.",
+js_fail: "순찰 실패: ",
+js_pager: "{cur} / {pages} 페이지 · 총 {total}개 (필터 후)",
+js_shown: " 현재 {n}개 표시 중",
+no_desc: "(설명 없음)",
+delta_fmt: "{sd}★ 이번 라운드",
+heat_line: "열도 {heat} / 100 · 푸시 {date}",
+verdict_prefix: "분석 (규칙): ",
+tag_title: "이 태그로 전체 정보 필터링",
+seed_note: "학습 포인트: ",
+seed_live: "★ {stars} · 열도 {heat} · {grade}",
+seed_refreshed: "개별 리프레시",
+seed_renamed: "구 {name}에서 개명",
+seed_gone: "⚠️ 삭제/개명 미추적 가능성 (리프레시 확인 {ts})",
+seed_static: "이번 순찰에 미적중 · 지명 모니터링 중",
+seed_group_fmt: "▸ {cat} ({n})",
+brief_situation: "【오늘의 정세】",
+brief_surge_t: "【급상승 TOP3】",
+brief_heat_t: "【열도 TOP3】",
+brief_sec_t: "【보안 초점】",
+brief_skill_t: "【Skill 초점】",
+brief_wl_t: "【중점 모니터링 동향】",
+brief_trend_t: "【토픽 동향】",
+brief_rename_t: "【이름 변경 동향】",
+brief_nodata_delta: "증분 데이터 없음 (두 번의 순찰 필요)",
+brief_no_sec: "보안 초점 없음",
+brief_no_skill: "Skill 초점 없음",
+brief_meta: "★ {stars} · 열도 {heat}",
+brief_delta: " · {sd}★ 이번 라운드",
+brief_hot_tags: "인기 태그: ",
+brief_wl_line: "실시간 데이터 확보 <b>{live}</b> / {total} 시드",
+brief_wl_top: "선두 시드: ",
+brief_topics_label: "키워드 열도: ",
+brief_topic_item: "{topic} ({count}개 · ★{stars})",
+brief_rename_line: "개명: {from} → ",
+oneliner_empty: "정보 저장소에 데이터가 없습니다. 순찰을 실행하면 오늘의 정세가 생성됩니다.",
+oneliner_p1: "오늘 {n}개 저장소를 모니터링 중이며, 이번 신규는 {new}개, 순찰 채널은 {ok}/{total} 정상입니다.",
+oneliner_surge: " 가장 빠르게 상승한 것은 {name} (이번 +{d}★).",
+oneliner_heat: " 열도 1위는 {name} (열도 {heat}).",
+oneliner_sec: " 보안 초점은 {name}",
+oneliner_sec_tags: ", 인기 보안 태그: {tags}",
+oneliner_end: ".",
+verdict_up: "지난 라운드 +{d}★, ",
+verdict_down: "이번 라운드 {d}★ 하락, ",
+verdict_flat: "이번 라운드 스타 변동 없음, ",
+verdict_new: "정보 저장소 신규, ",
+verdict_body: "{point} 프로젝트. 그 {point} 구현을 볼 가치가 있다.",
+verdict_generic: "열도 {heat}, 주요 포인트: {tag}.",
+tag_practice_suffix: "엔지니어링 실무",
+kv_err_title: "구성 오류",
+kv_err_h1: "◢ 구성 오류",
+kv_err_body: "KV가 바인딩되지 않았습니다: 이 Worker에 변수 이름 <b>INTEL_KV</b> 로 KV namespace를 바인딩한 뒤 재배포하세요.",
+},
+es: {
+doc_title: "GitHub Intel Center",
+h1: "◢ Centro de Inteligencia de GitHub",
+tagline: "GITHUB INTEL CENTER // Barridos de inteligencia de código abierto · Análisis por reglas · No generado por IA",
+clock_label: "Hora de Pekín CST",
+status_label: "Estado del barrido: ",
+status_ok: "✅ OK",
+status_warn: "⚠️ Error",
+status_none: "Sin datos",
+channels_part: " · Canales {ok}/{total}",
+toggle_collapse: "Contraer barra ▴",
+toggle_expand: "Expandir barra ▾",
+tagcloud_label: "🏷 Etiquetas populares (clic para filtrar toda la inteligencia)",
+tagcloud_empty: "Sin datos de etiquetas",
+trend_label: "📈 Tendencias de temas",
+trend_fmt: "+{d}★/24h · subiendo {n} rondas seguidas",
+filter_all: "Todo",
+grade_all: "Grado: todos",
+grade_btn_fmt: "Nivel {g}",
+grade_card_fmt: "Nivel {g}",
+search_ph: "🔍 Buscar repos / descripciones / lenguajes",
+pill_label: "Etiqueta: ",
+pill_clear: "✕ Quitar etiqueta",
+expand_all: "Expandir todo",
+collapse_all: "Contraer todo",
+ticker_full: "Último barrido {ts} · {n} repos vigilados · {new} nuevos en esta ronda · Canales OK {ok}/{total}",
+ticker_err: " · Canales con error: {list}",
+ticker_src: " · Fuente: GitHub Search API (límites bajos sin autenticación) · Análisis por motor de reglas",
+ticker_none: "Aún no hay datos · Pulsa 'Barrer ahora' o POST /api/refresh para la primera inteligencia",
+kpi_repos: "Repos vigilados",
+kpi_new: "Nuevos en la ronda",
+kpi_heat: "Calor máximo",
+kpi_channels: "Canales de inteligencia",
+kpi_seeds: "Semillas vigiladas",
+kpi_last: "Último barrido (CST)",
+refresh_btn: "↻ Barrer ahora (límite 30 min)",
+empty_text: "▣ El almacén de inteligencia está vacío. Ejecuta primero un barrido: el botón de abajo o <code>POST /api/refresh</code>. La API de GitHub sin autenticación tiene una cuota de búsqueda por hora limitada: no actualices a menudo (la actualización manual del panel está limitada a 30 minutos).",
+empty_btn: "Barrer ahora",
+overview_title: "◢ PANORAMA DE INTELIGENCIA",
+overview_para: "Este panel sigue los repositorios populares de GitHub: la tabla de auge se ordena por el crecimiento de estrellas de esta ronda (hacen falta al menos dos barridos), el resto por puntuación de calor. Calor = mezcla ponderada por reglas de escala de estrellas + crecimiento de la ronda + frescura de pushes + actividad de forks; los puntos de aprendizaje son mapeos de palabras clave; grados: S ≥70, A ≥45, B el resto.",
+sec_surge: "◢ AUGE DE ESTRELLAS",
+sec_newstars: "◢ ESTRELLAS NUEVAS",
+sec_ai: "◢ ZONA AI / AGENT",
+sec_security: "◢ INTELIGENCIA DE SEGURIDAD",
+sec_src: "◢ CAZA SRC",
+sec_seclearn: "◢ APRENDIZAJE DE SEGURIDAD",
+sec_skills: "◢ ECOSISTEMA SKILL",
+sec_creator: "◢ KIT DEL CREADOR",
+sec_watchlist: "◢ WATCHLIST",
+sec_all: "◢ TODA LA INTELIGENCIA",
+nodata: "Sin datos",
+show_more: "Mostrar los {n} ▾",
+show_less: "Contraer ▴",
+watchlist_para: "Lista de semillas elegida a mano (preseleccionada) en cinco grupos: Skill / Escritura / Investigación / Creadores / Seguridad. Si una semilla aparece en el barrido actual, su tarjeta muestra ★ en vivo, calor y crecimiento de la ronda; las que no aparecen se refrescan por turnos con un cursor ('refresco individual', máx. 3 por ronda, la tarjeta muestra la hora de refresco); un renombre detectado al refrescar muestra el nombre actual y un 404 se marca como posible eliminación; las que aún no han tenido turno se marcan 'monitorización nominal'. Los puntos de aprendizaje de las semillas son análisis humano, distinto de los veredictos por reglas.",
+all_foot: "Fuente: GitHub Search API (pública; límites sin autenticación ≈10 búsquedas/min con cuota por hora: define GITHUB_TOKEN para subirlos). El crecimiento de estrellas requiere al menos dos barridos comparando instantáneas; en la primera ronda todo es 'nuevo en el almacén'. Todos los veredictos de este sitio los produce un motor de reglas; los puntos de aprendizaje de las semillas están escritos por humanos; ninguno constituye una recomendación.",
+pager_prev: "← Anterior",
+pager_next: "Siguiente →",
+brief_fab: "📋 Informe presidencial",
+brief_head: "📋 INFORME PRESIDENCIAL",
+brief_min: "Minimizar",
+brief_close: "Cerrar",
+brief_foot: "Generado a las {time} CST · Motor de reglas (no generado por IA)",
+js_refreshing: "Barriendo… (tarda unos segundos)",
+js_throttled: "Limitado: han pasado menos de 30 minutos desde el último barrido, inténtalo más tarde.",
+js_fail: "El barrido falló: ",
+js_pager: "Página {cur} / {pages} · {total} elementos (tras el filtro)",
+js_shown: " · mostrando {n}",
+no_desc: "(sin descripción)",
+delta_fmt: "{sd}★ esta ronda",
+heat_line: "Calor {heat} / 100 · Push {date}",
+verdict_prefix: "Veredicto (reglas): ",
+tag_title: "Filtrar toda la inteligencia por esta etiqueta",
+seed_note: "Punto de aprendizaje: ",
+seed_live: "★ {stars} · Calor {heat} · {grade}",
+seed_refreshed: "Refresco individual",
+seed_renamed: "antes {name}, renombrado",
+seed_gone: "⚠️ Posible eliminación / renombre sin seguir (comprobación {ts})",
+seed_static: "No apareció en este barrido · Monitorización nominal",
+seed_group_fmt: "▸ {cat} ({n})",
+brief_situation: "[Panorama de hoy]",
+brief_surge_t: "[TOP 3 en ascenso]",
+brief_heat_t: "[TOP 3 por calor]",
+brief_sec_t: "[Foco de seguridad]",
+brief_skill_t: "[Foco Skill]",
+brief_wl_t: "[Actividad de vigilancia]",
+brief_trend_t: "[Tendencias]",
+brief_rename_t: "[Renombrados]",
+brief_nodata_delta: "Sin datos de crecimiento (hacen falta dos barridos)",
+brief_no_sec: "Sin foco de seguridad",
+brief_no_skill: "Sin foco Skill",
+brief_meta: "★ {stars} · Calor {heat}",
+brief_delta: " · {sd}★ esta ronda",
+brief_hot_tags: "Etiquetas populares: ",
+brief_wl_line: "Datos en vivo de <b>{live}</b> / {total} semillas",
+brief_wl_top: "Semilla líder: ",
+brief_topics_label: "Calor de palabras clave: ",
+brief_topic_item: "{topic} ({count} repos · ★{stars})",
+brief_rename_line: "Renombrado: {from} → ",
+oneliner_empty: "El almacén está vacío; ejecuta un barrido para generar la situación de hoy.",
+oneliner_p1: "Hoy se vigilan {n} repos, {new} nuevos en esta ronda, canales de barrido {ok}/{total} OK. ",
+oneliner_surge: "El que más sube: {name} (+{d}★ esta ronda). ",
+oneliner_heat: "Líder de calor: {name} (calor {heat}). ",
+oneliner_sec: "Foco de seguridad: {name}",
+oneliner_sec_tags: "; etiquetas de seguridad populares: {tags}",
+oneliner_end: ".",
+verdict_up: "+{d}★ en la última ronda, ",
+verdict_down: "{d}★ en esta ronda, ",
+verdict_flat: "Estrellas sin cambio en esta ronda, ",
+verdict_new: "Nuevo en el almacén, ",
+verdict_body: "proyecto de {point}: merece la pena estudiar su {point}.",
+verdict_generic: "calor {heat}; ángulo clave: {tag}.",
+tag_practice_suffix: "prácticas de ingeniería",
+kv_err_title: "Error de configuración",
+kv_err_h1: "◢ Error de configuración",
+kv_err_body: "KV no está vinculado: vincula un namespace KV a este Worker con el nombre de variable <b>INTEL_KV</b> y vuelve a desplegar.",
+},
+ar: {
+doc_title: "مركز استخبارات GitHub",
+h1: "◢ مركز استخبارات GitHub",
+tagline: "GITHUB INTEL CENTER // مسح استخباراتي مفتوح المصدر · تحليل بالقواعد · ليس مولّداً بالذكاء الاصطناعي",
+clock_label: "بتوقيت بكين CST",
+status_label: "حالة المسح: ",
+status_ok: "✅ طبيعي",
+status_warn: "⚠️ خطأ",
+status_none: "لا بيانات",
+channels_part: " · القنوات {ok}/{total}",
+toggle_collapse: "طي شريط الأدوات ▴",
+toggle_expand: "توسيع شريط الأدوات ▾",
+tagcloud_label: "🏷 الوسوم الشائعة (انقر وسمًا لتصفية كل المعلومات)",
+tagcloud_empty: "لا بيانات وسوم",
+trend_label: "📈 اتجاهات المواضيع",
+trend_fmt: "+{d}★/24 ساعة · صاعد منذ {n} جولات",
+filter_all: "الكل",
+grade_all: "الدرجة: الكل",
+grade_btn_fmt: "المستوى {g}",
+grade_card_fmt: "المستوى {g}",
+search_ph: "🔍 ابحث في المستودعات / الأوصاف / اللغات",
+pill_label: "الوسم: ",
+pill_clear: "✕ مسح الوسم",
+expand_all: "توسيع الكل",
+collapse_all: "طي الكل",
+ticker_full: "آخر مسح {ts} · {n} مستودعًا قيد المراقبة · {new} جديد في هذه الجولة · القنوات سليمة {ok}/{total}",
+ticker_err: " · قنوات معطلة: {list}",
+ticker_src: " · المصدر: GitHub Search API (حدود منخفضة دون مصادقة) · التحليل من محرك القواعد",
+ticker_none: "لا بيانات مسح بعد · انقر «مسح الآن» أو POST /api/refresh لجلب أول المعلومات",
+kpi_repos: "المستودعات المراقبة",
+kpi_new: "جديد هذه الجولة",
+kpi_heat: "أعلى حرارة",
+kpi_channels: "قنوات الاستخبارات",
+kpi_seeds: "بذور المراقبة المركزة",
+kpi_last: "آخر مسح (CST)",
+refresh_btn: "↻ مسح الآن (خنق 30 دقيقة)",
+empty_text: "▣ مخزن المعلومات فارغ. نفّذ مسحًا أولًا: الزر أدناه أو <code>POST /api/refresh</code>. لواجهة GitHub غير المصادقة حصة بحث ساعية محدودة، فلا تحدّث كثيرًا (التحديث اليدوي للوحة مخنوق إلى 30 دقيقة).",
+empty_btn: "مسح الآن",
+overview_title: "◢ نظرة عامة على المعلومات",
+overview_para: "تتتبع هذه اللوحة مستودعات GitHub الشائعة: تُرتَّب لوحة الصعود حسب نمو النجوم في هذه الجولة (يلزم مسحان على الأقل للنمو)، والباقي حسب درجة الحرارة. الحرارة = مزيج مرجح بالقواعد من حجم النجوم + نمو الجولة + حداثة الدفعات + نشاط التفرعات؛ ونقاط التعلم خرائط كلمات مفتاحية بالقواعد؛ والدرجات: S لا تقل عن 70 وA لا تقل عن 45 وB لما عداها.",
+sec_surge: "◢ لوحة الصعود",
+sec_newstars: "◢ نجوم جديدة",
+sec_ai: "◢ منطقة AI / AGENT",
+sec_security: "◢ معلومات الأمن",
+sec_src: "◢ صيد SRC",
+sec_seclearn: "◢ تعلّم الأمن",
+sec_skills: "◢ منظومة Skill",
+sec_creator: "◢ أدوات صانع المحتوى",
+sec_watchlist: "◢ المراقبة المركزة",
+sec_all: "◢ كل المعلومات",
+nodata: "لا بيانات",
+show_more: "عرض كل {n} ▾",
+show_less: "طي ▴",
+watchlist_para: "قائمة بذور مختارة يدويًا (مصفاة مسبقًا) في خمس فئات: Skill / الكتابة / البحث / صناع المحتوى / الأمن. إذا أصاب المسح الحالي بذرةً، تعرض بطاقتها النجوم والحرارة ونمو هذه الجولة مباشرة؛ والبذور غير المصابة تُنعش بالتناوب عبر مؤشر («إنعاش فردي»، بحد أقصى 3 في الجولة، وتظهر البطاقة وقت الإنعاش)؛ وإعادة التسمية المكتشفة عند الإنعاش تُظهر الاسم الحالي، و404 يُعلَّم كاحتمال حذف؛ وما لم يصل دوره بعد يُعلَّم «مراقبة بالاسم». نقاط تعلم البذور تحليل بشري، متميز عن أحكام القواعد.",
+all_foot: "المصدر: GitHub Search API (واجهة عامة؛ الحدود دون مصادقة نحو 10 عمليات بحث/دقيقة مع حصة ساعية — عيّن GITHUB_TOKEN لرفعها). نمو النجوم يتطلب مسحين على الأقل بمقارنة اللقطات؛ في الجولة الأولى كل شيء «جديد في المخزن». جميع الأحكام هنا من محرك قواعد؛ ونقاط تعلم بذور المراقبة المركزة مكتوبة بشريًا؛ ولا يشكل أي منها توصية.",
+pager_prev: "← السابق",
+pager_next: "التالي →",
+brief_fab: "📋 الموجز الرئاسي",
+brief_head: "📋 الموجز الرئاسي · DAILY BRIEF",
+brief_min: "تصغير",
+brief_close: "إغلاق",
+brief_foot: "وُلّد في {time} CST · محرك قواعد (ليس ذكاءً اصطناعيًا)",
+js_refreshing: "جارٍ المسح… (يستغرق بضع ثوانٍ)",
+js_throttled: "مخنوق: لم تمضِ 30 دقيقة على آخر مسح، حاول لاحقًا.",
+js_fail: "فشل المسح: ",
+js_pager: "صفحة {cur} / {pages} · المجموع {total} (بعد التصفية)",
+js_shown: " · يُعرض {n}",
+no_desc: "(بلا وصف)",
+delta_fmt: "{sd}★ هذه الجولة",
+heat_line: "الحرارة {heat} / 100 · الدفع {date}",
+verdict_prefix: "الحكم (قواعد): ",
+tag_title: "تصفية كل المعلومات بهذا الوسم",
+seed_note: "نقطة التعلم: ",
+seed_live: "★ {stars} · الحرارة {heat} · {grade}",
+seed_refreshed: "إنعاش فردي",
+seed_renamed: "سابقًا {name}، أُعيدت تسميته",
+seed_gone: "⚠️ احتمال حذف / إعادة تسمية غير متعقبة (فحص الإنعاش {ts})",
+seed_static: "لم يُصَب في مسح هذه الجولة · مراقبة بالاسم",
+seed_group_fmt: "▸ {cat} ({n})",
+brief_situation: "[موجز اليوم]",
+brief_surge_t: "[أسرع ٣ صاعدة]",
+brief_heat_t: "[الأعلى حرارة ٣]",
+brief_sec_t: "[تركيز الأمان]",
+brief_skill_t: "[تركيز Skill]",
+brief_wl_t: "[نشاط المراقبة]",
+brief_trend_t: "[اتجاهات المواضيع]",
+brief_rename_t: "[تغييرات الأسماء]",
+brief_nodata_delta: "لا بيانات نمو (يلزم مسحان)",
+brief_no_sec: "لا تركيز أمني",
+brief_no_skill: "لا تركيز Skill",
+brief_meta: "★ {stars} · الحرارة {heat}",
+brief_delta: " · {sd}★ هذه الجولة",
+brief_hot_tags: "الوسوم الشائعة: ",
+brief_wl_line: "بيانات حية لـ <b>{live}</b> / {total} بذرة",
+brief_wl_top: "البذرة المتصدرة: ",
+brief_topics_label: "حرارة الكلمات المفتاحية: ",
+brief_topic_item: "{topic} ({count} مستودع · ★{stars})",
+brief_rename_line: "أُعيدت التسمية: {from} → ",
+oneliner_empty: "مخزن المعلومات فارغ؛ نفّذ مسحًا لتوليد موقف اليوم.",
+oneliner_p1: "تُراقب اليوم {n} مستودعًا، و{new} جديد في هذه الجولة، وقنوات المسح سليمة {ok}/{total}.",
+oneliner_surge: " الأسرع صعودًا هو {name} (+{d}★ هذه الجولة).",
+oneliner_heat: " متصدر الحرارة هو {name} (الحرارة {heat}).",
+oneliner_sec: " تركيز الأمن هو {name}",
+oneliner_sec_tags: "، والوسوم الأمنية الشائعة: {tags}",
+oneliner_end: ".",
+verdict_up: "صعد +{d}★ في الجولة الماضية، ",
+verdict_down: "تراجع {d}★ هذه الجولة، ",
+verdict_flat: "النجوم ثابتة هذه الجولة، ",
+verdict_new: "جديد في المخزن، ",
+verdict_body: "مشروع {point} — يستحق دراسة {point} فيه.",
+verdict_generic: "الحرارة {heat}؛ الزاوية الأساسية: {tag}.",
+tag_practice_suffix: "ممارسات هندسية",
+kv_err_title: "خطأ في الإعداد",
+kv_err_h1: "◢ خطأ في الإعداد",
+kv_err_body: "KV غير مربوط: اربط مساحة أسماء KV بهذا الـ Worker باسم المتغير <b>INTEL_KV</b> ثم أعد النشر.",
+},
+};
+
+// 通道显示名（按通道 key，与 buildChannels 的 key 对应；name 字段本身保持中文供数据层使用）
+const CHANNEL_I18N = {
+"surge": { zh: "飙升新星", en: "Star Surge", ru: "Рост звёзд", uk: "Зростання зірок", ja: "急上昇", ko: "급상승", es: "Auge de estrellas", ar: "الصاعدون"},
+"trending-week": { zh: "本周热门", en: "Trending This Week", ru: "Популярное недели", uk: "Популярне тижня", ja: "今週の人気", ko: "이번 주 인기", es: "Tendencia semanal", ar: "رائج هذا الأسبوع"},
+"ai-agent": { zh: "AI / AGENT", en: "AI / AGENT", ru: "AI / AGENT", uk: "AI / AGENT", ja: "AI / AGENT", ko: "AI / AGENT", es: "AI / AGENT", ar: "AI / AGENT"},
+"workers": { zh: "边缘 / Bot", en: "Edge / Bots", ru: "Edge / Боты", uk: "Edge / Боти", ja: "エッジ / Bot", ko: "엣지 / 봇", es: "Edge / Bots", ar: "الحافة / البوتات"},
+"media": { zh: "多媒体生成", en: "Media Generation", ru: "Генерация медиа", uk: "Генерація медіа", ja: "メディア生成", ko: "미디어 생성", es: "Generación multimedia", ar: "توليد الوسائط"},
+"devtools": { zh: "开发工具", en: "Dev Tools", ru: "Инструменты разработки", uk: "Інструменти розробки", ja: "開発ツール", ko: "개발 도구", es: "Herramientas de desarrollo", ar: "أدوات التطوير"},
+"security": { zh: "网安 · 红队 · SRC", en: "Security · Red Team · SRC", ru: "Безопасность · Red Team · SRC", uk: "Безпека · Red Team · SRC", ja: "セキュリティ · レッドチーム · SRC", ko: "보안 · 레드팀 · SRC", es: "Seguridad · Red Team · SRC", ar: "الأمن · الفريق الأحمر · SRC"},
+"skills": { zh: "Skill 生态", en: "Skill Ecosystem", ru: "Экосистема Skill", uk: "Екосистема Skill", ja: "Skill エコシステム", ko: "Skill 생태계", es: "Ecosistema Skill", ar: "منظومة Skill"},
+"creator": { zh: "自媒体全套", en: "Creator Toolkit", ru: "Инструменты автора", uk: "Інструменти автора", ja: "クリエイターツール", ko: "크리에이터 툴킷", es: "Kit del creador", ar: "أدوات صانع المحتوى"},
+"src-hunt": { zh: "SRC · 挖洞", en: "SRC · Bug Hunting", ru: "SRC · Поиск уязвимостей", uk: "SRC · Пошук вразливостей", ja: "SRC · 脆弱性ハンティング", ko: "SRC · 취약점 헌팅", es: "SRC · Caza de fallos", ar: "SRC · صيد الثغرات"},
+"sec-learning": { zh: "网安学习资料", en: "Security Learning", ru: "Обучение безопасности", uk: "Навчання безпеки", ja: "セキュリティ学習", ko: "보안 학습", es: "Aprendizaje de seguridad", ar: "تعلّم الأمن"},
+};
+// 种子分类显示名（按分类 key；buildWatchlist 产出的 catName 保持中文供 API 使用，面板渲染时走这里）
+const SEED_CAT_I18N = {
+skills: { zh: "Skill 生态", en: "Skill Ecosystem", ru: "Экосистема Skill", uk: "Екосистема Skill", ja: "Skill エコシステム", ko: "Skill 생태계", es: "Ecosistema Skill", ar: "منظومة Skill"},
+writing: { zh: "写作 Skill", en: "Writing Skills", ru: "Skill для письма", uk: "Письмові Skill", ja: "執筆 Skill", ko: "글쓰기 Skill", es: "Skills de escritura", ar: "Skill الكتابة"},
+science: { zh: "科研 Skill", en: "Research Skills", ru: "Научные Skill", uk: "Наукові Skill", ja: "研究 Skill", ko: "연구 Skill", es: "Skills de investigación", ar: "Skill البحث"},
+creator: { zh: "自媒体全套", en: "Creator Toolkit", ru: "Инструменты автора", uk: "Інструменти автора", ja: "クリエイターツール", ko: "크리에이터 툴킷", es: "Kit del creador", ar: "أدوات صانع المحتوى"},
+security: { zh: "网安 · 红队 · SRC", en: "Security · Red Team · SRC", ru: "Безопасность · Red Team · SRC", uk: "Безпека · Red Team · SRC", ja: "セキュリティ · レッドチーム · SRC", ko: "보안 · 레드팀 · SRC", es: "Seguridad · Red Team · SRC", ar: "الأمن · الفريق الأحمر · SRC"},
+};
+// 标签显示名：键为记录里存的中文标签（LEARNING_MAP 与 SECURITY_TAG_MAP 的全部产出 + 兜底「工程实现」），渲染时翻译；
+// 「<语言> 工程实践」型兜底标签按后缀规则翻译（见 tagLabel）；表中缺失的标签回退中文原文，绝不留空。
+const TAG_I18N = {
+en: { "MCP 协议接入": "MCP Integration", "Agent 架构": "Agent Architecture", "红队评估方法": "Red Team Assessment", "漏洞管理": "Vulnerability Management", "SRC 众测思路": "Bug Bounty Approach", "开源情报": "OSINT", "Skill 封装范式": "Skill Packaging Patterns", "字幕工程": "Subtitle Engineering", "短视频工作流": "Short-Video Workflow", "RAG 检索": "RAG Retrieval", "边缘部署": "Edge Deployment", "工作流节点": "Workflow Nodes", "音视频管线": "Audio/Video Pipeline", "浏览器自动化": "Browser Automation", "本地存储": "Local Storage", "大模型接入": "LLM Integration", "Bot 交互": "Bot Interaction", "向量检索": "Vector Search", "语音合成": "Speech Synthesis", "图像生成": "Image Generation", "提示工程": "Prompt Engineering", "工作流编排": "Workflow Orchestration", "容器化部署": "Container Deployment", "高性能系统": "High-Performance Systems", "命令行工具": "CLI Tools", "端侧推理": "On-Device Inference", "SQL 注入": "SQL Injection", "XSS": "XSS", "SSRF": "SSRF", "RCE": "RCE", "CTF 竞赛": "CTF Competitions", "开源情报 OSINT": "OSINT", "恶意代码分析": "Malware Analysis", "数字取证": "Digital Forensics", "蓝队防御": "Blue Team Defense", "代码审计": "Code Audit", "内网渗透": "Intranet Penetration", "权限提升": "Privilege Escalation", "漏洞扫描": "Vulnerability Scanning", "PoC 研究": "PoC Research", "漏洞复盘": "Vulnerability Write-ups", "学习路线": "Learning Roadmap", "钓鱼防御演练": "Phishing Defense Drills", "逆向工程": "Reverse Engineering", "模糊测试": "Fuzz Testing", "DevSecOps": "DevSecOps", "工程实现": "Engineering Implementation"},
+ru: { "MCP 协议接入": "Интеграция MCP", "Agent 架构": "Архитектура агентов", "红队评估方法": "Методика Red Team", "漏洞管理": "Управление уязвимостями", "SRC 众测思路": "Подход к Bug Bounty", "开源情报": "OSINT", "Skill 封装范式": "Паттерны упаковки Skill", "字幕工程": "Инженерия субтитров", "短视频工作流": "Воркфлоу коротких видео", "RAG 检索": "RAG-поиск", "边缘部署": "Развёртывание на Edge", "工作流节点": "Узлы воркфлоу", "音视频管线": "Аудио/видео пайплайн", "浏览器自动化": "Автоматизация браузера", "本地存储": "Локальное хранилище", "大模型接入": "Интеграция LLM", "Bot 交互": "Взаимодействие с ботами", "向量检索": "Векторный поиск", "语音合成": "Синтез речи", "图像生成": "Генерация изображений", "提示工程": "Промпт-инженерия", "工作流编排": "Оркестрация воркфлоу", "容器化部署": "Контейнерное развёртывание", "高性能系统": "Высокопроизводительные системы", "命令行工具": "CLI-инструменты", "端侧推理": "Инференс на устройстве", "SQL 注入": "SQL-инъекция", "XSS": "XSS", "SSRF": "SSRF", "RCE": "RCE", "CTF 竞赛": "CTF-соревнования", "开源情报 OSINT": "OSINT", "恶意代码分析": "Анализ вредоносного ПО", "数字取证": "Цифровая криминалистика", "蓝队防御": "Защита Blue Team", "代码审计": "Аудит кода", "内网渗透": "Внутреннее проникновение", "权限提升": "Повышение привилегий", "漏洞扫描": "Сканирование уязвимостей", "PoC 研究": "PoC-исследования", "漏洞复盘": "Разборы уязвимостей", "学习路线": "Маршрут обучения", "钓鱼防御演练": "Учения по защите от фишинга", "逆向工程": "Обратная инженерия", "模糊测试": "Фаззинг", "DevSecOps": "DevSecOps", "工程实现": "Инженерная реализация"},
+uk: { "MCP 协议接入": "Інтеграція MCP", "Agent 架构": "Архітектура агентів", "红队评估方法": "Методика Red Team", "漏洞管理": "Керування вразливостями", "SRC 众测思路": "Підхід до Bug Bounty", "开源情报": "OSINT", "Skill 封装范式": "Патерни пакування Skill", "字幕工程": "Інженерія субтитрів", "短视频工作流": "Воркфлоу коротких відео", "RAG 检索": "RAG-пошук", "边缘部署": "Розгортання на Edge", "工作流节点": "Вузли воркфлоу", "音视频管线": "Аудіо/відео пайплайн", "浏览器自动化": "Автоматизація браузера", "本地存储": "Локальне сховище", "大模型接入": "Інтеграція LLM", "Bot 交互": "Взаємодія з ботами", "向量检索": "Векторний пошук", "语音合成": "Синтез мовлення", "图像生成": "Генерація зображень", "提示工程": "Промпт-інженерія", "工作流编排": "Оркестрація воркфлоу", "容器化部署": "Контейнерне розгортання", "高性能系统": "Високопродуктивні системи", "命令行工具": "CLI-інструменти", "端侧推理": "Інференс на пристрої", "SQL 注入": "SQL-ін'єкція", "XSS": "XSS", "SSRF": "SSRF", "RCE": "RCE", "CTF 竞赛": "CTF-змагання", "开源情报 OSINT": "OSINT", "恶意代码分析": "Аналіз шкідливого ПЗ", "数字取证": "Цифрова криміналістика", "蓝队防御": "Захист Blue Team", "代码审计": "Аудит коду", "内网渗透": "Внутрішнє проникнення", "权限提升": "Підвищення привілеїв", "漏洞扫描": "Сканування вразливостей", "PoC 研究": "PoC-дослідження", "漏洞复盘": "Розбори вразливостей", "学习路线": "Маршрут навчання", "钓鱼防御演练": "Навчання із захисту від фішингу", "逆向工程": "Зворотна інженерія", "模糊测试": "Фазинг", "DevSecOps": "DevSecOps", "工程实现": "Інженерна реалізація"},
+ja: { "MCP 协议接入": "MCP 連携", "Agent 架构": "Agent アーキテクチャ", "红队评估方法": "レッドチーム評価", "漏洞管理": "脆弱性管理", "SRC 众测思路": "バグバウンティの考え方", "开源情报": "OSINT", "Skill 封装范式": "Skill パッケージング", "字幕工程": "字幕エンジニアリング", "短视频工作流": "ショート動画ワークフロー", "RAG 检索": "RAG 検索", "边缘部署": "エッジ配置", "工作流节点": "ワークフローノード", "音视频管线": "音声・動画パイプライン", "浏览器自动化": "ブラウザ自動化", "本地存储": "ローカルストレージ", "大模型接入": "LLM 連携", "Bot 交互": "Bot インタラクション", "向量检索": "ベクトル検索", "语音合成": "音声合成", "图像生成": "画像生成", "提示工程": "プロンプト設計", "工作流编排": "ワークフロー編成", "容器化部署": "コンテナ配置", "高性能系统": "高性能システム", "命令行工具": "CLI ツール", "端侧推理": "オンデバイス推論", "SQL 注入": "SQL インジェクション", "XSS": "XSS", "SSRF": "SSRF", "RCE": "RCE", "CTF 竞赛": "CTF 大会", "开源情报 OSINT": "OSINT", "恶意代码分析": "マルウェア解析", "数字取证": "デジタルフォレンジック", "蓝队防御": "ブルーチーム防御", "代码审计": "コード監査", "内网渗透": "内部ネットワーク侵入", "权限提升": "権限昇格", "漏洞扫描": "脆弱性スキャン", "PoC 研究": "PoC 研究", "漏洞复盘": "脆弱性ライトアップ", "学习路线": "学習ロードマップ", "钓鱼防御演练": "フィッシング防御演習", "逆向工程": "リバースエンジニアリング", "模糊测试": "ファジング", "DevSecOps": "DevSecOps", "工程实现": "エンジニアリング実装"},
+ko: { "MCP 协议接入": "MCP 연동", "Agent 架构": "Agent 아키텍처", "红队评估方法": "레드팀 평가", "漏洞管理": "취약점 관리", "SRC 众测思路": "버그 바운티 접근법", "开源情报": "OSINT", "Skill 封装范式": "Skill 패키징 패턴", "字幕工程": "자막 엔지니어링", "短视频工作流": "숏폼 워크플로", "RAG 检索": "RAG 검색", "边缘部署": "엣지 배포", "工作流节点": "워크플로 노드", "音视频管线": "오디오/비디오 파이프라인", "浏览器自动化": "브라우저 자동화", "本地存储": "로컬 스토리지", "大模型接入": "LLM 연동", "Bot 交互": "봇 상호작용", "向量检索": "벡터 검색", "语音合成": "음성 합성", "图像生成": "이미지 생성", "提示工程": "프롬프트 엔지니어링", "工作流编排": "워크플로 오케스트레이션", "容器化部署": "컨테이너 배포", "高性能系统": "고성능 시스템", "命令行工具": "CLI 도구", "端侧推理": "온디바이스 추론", "SQL 注入": "SQL 인젝션", "XSS": "XSS", "SSRF": "SSRF", "RCE": "RCE", "CTF 竞赛": "CTF 대회", "开源情报 OSINT": "OSINT", "恶意代码分析": "악성코드 분석", "数字取证": "디지털 포렌식", "蓝队防御": "블루팀 방어", "代码审计": "코드 감사", "内网渗透": "내부망 침투", "权限提升": "권한 상승", "漏洞扫描": "취약점 스캔", "PoC 研究": "PoC 연구", "漏洞复盘": "취약점 라이트업", "学习路线": "학습 로드맵", "钓鱼防御演练": "피싱 방어 훈련", "逆向工程": "리버스 엔지니어링", "模糊测试": "퍼징", "DevSecOps": "DevSecOps", "工程实现": "엔지니어링 구현"},
+es: { "MCP 协议接入": "Integración MCP", "Agent 架构": "Arquitectura de agentes", "红队评估方法": "Evaluación Red Team", "漏洞管理": "Gestión de vulnerabilidades", "SRC 众测思路": "Enfoque Bug Bounty", "开源情报": "OSINT", "Skill 封装范式": "Patrones de empaquetado Skill", "字幕工程": "Ingeniería de subtítulos", "短视频工作流": "Flujo de video corto", "RAG 检索": "Recuperación RAG", "边缘部署": "Despliegue Edge", "工作流节点": "Nodos de flujo", "音视频管线": "Pipeline de audio/video", "浏览器自动化": "Automatización del navegador", "本地存储": "Almacenamiento local", "大模型接入": "Integración LLM", "Bot 交互": "Interacción con bots", "向量检索": "Búsqueda vectorial", "语音合成": "Síntesis de voz", "图像生成": "Generación de imágenes", "提示工程": "Ingeniería de prompts", "工作流编排": "Orquestación de flujos", "容器化部署": "Despliegue en contenedores", "高性能系统": "Sistemas de alto rendimiento", "命令行工具": "Herramientas CLI", "端侧推理": "Inferencia en el dispositivo", "SQL 注入": "Inyección SQL", "XSS": "XSS", "SSRF": "SSRF", "RCE": "RCE", "CTF 竞赛": "Competiciones CTF", "开源情报 OSINT": "OSINT", "恶意代码分析": "Análisis de malware", "数字取证": "Forense digital", "蓝队防御": "Defensa Blue Team", "代码审计": "Auditoría de código", "内网渗透": "Penetración de intranet", "权限提升": "Escalada de privilegios", "漏洞扫描": "Escaneo de vulnerabilidades", "PoC 研究": "Investigación PoC", "漏洞复盘": "Análisis de vulnerabilidades", "学习路线": "Ruta de aprendizaje", "钓鱼防御演练": "Simulacros antiphishing", "逆向工程": "Ingeniería inversa", "模糊测试": "Fuzzing", "DevSecOps": "DevSecOps", "工程实现": "Implementación de ingeniería"},
+ar: { "MCP 协议接入": "تكامل MCP", "Agent 架构": "بنية الوكلاء", "红队评估方法": "تقييم الفريق الأحمر", "漏洞管理": "إدارة الثغرات", "SRC 众测思路": "منهج صيد الثغرات", "开源情报": "OSINT", "Skill 封装范式": "أنماط تغليف Skill", "字幕工程": "هندسة الترجمة المرئية", "短视频工作流": "سير عمل الفيديو القصير", "RAG 检索": "استرجاع RAG", "边缘部署": "النشر على الحافة", "工作流节点": "عقد سير العمل", "音视频管线": "خط أنابيب الصوت والفيديو", "浏览器自动化": "أتمتة المتصفح", "本地存储": "التخزين المحلي", "大模型接入": "تكامل النماذج اللغوية", "Bot 交互": "تفاعل البوتات", "向量检索": "البحث المتجهي", "语音合成": "توليف الكلام", "图像生成": "توليد الصور", "提示工程": "هندسة الأوامر", "工作流编排": "تنسيق سير العمل", "容器化部署": "النشر بالحاويات", "高性能系统": "أنظمة عالية الأداء", "命令行工具": "أدوات سطر الأوامر", "端侧推理": "الاستدلال على الجهاز", "SQL 注入": "حقن SQL", "XSS": "XSS", "SSRF": "SSRF", "RCE": "RCE", "CTF 竞赛": "مسابقات CTF", "开源情报 OSINT": "OSINT", "恶意代码分析": "تحليل البرمجيات الخبيثة", "数字取证": "الأدلة الجنائية الرقمية", "蓝队防御": "دفاع الفريق الأزرق", "代码审计": "تدقيق الكود", "内网渗透": "اختراق الشبكة الداخلية", "权限提升": "تصعيد الامتيازات", "漏洞扫描": "فحص الثغرات", "PoC 研究": "أبحاث PoC", "漏洞复盘": "مراجعات الثغرات", "学习路线": "خارطة التعلم", "钓鱼防御演练": "تدريبات الدفاع ضد التصيد", "逆向工程": "الهندسة العكسية", "模糊测试": "الاختبار العشوائي", "DevSecOps": "DevSecOps", "工程实现": "التحقيق الهندسي"},
+};
+
+function t(lang, key) {
+const s = STRINGS[lang];
+if (s && s[key] != null) return s[key];
+return STRINGS.zh[key] != null? STRINGS.zh[key]: key;
+}
+function tpl(str, params) {
+return String(str).replace(/\{(\w+)\}/g, (m, k) => (params && params[k] != null)? String(params[k]): m);
+}
+// 语言解析：?lang=（合法值）> Cookie intel-lang > Accept-Language 首项基础语言 > zh；setCookie 表示本次是 ?lang= 指定的、需要回写 Cookie
+function resolveLang(request) {
+let lang = null, fromQuery = false;
+try {
+const q = new URL(request.url).searchParams.get("lang");
+if (q && LANGS.includes(q)) { lang = q; fromQuery = true; }
+} catch {}
+if (!lang) {
+const m = /(?:^|;\s*)intel-lang=([a-z]{2})(?:;|$)/.exec(request.headers.get("cookie") || "");
+if (m && LANGS.includes(m[1])) lang = m[1];
+}
+if (!lang) {
+const base = (request.headers.get("accept-language") || "").split(",")[0].trim().toLowerCase().split("-")[0];
+if (LANGS.includes(base)) lang = base;
+}
+return { lang: lang || "zh", setCookie: fromQuery };
+}
+function langCookieValue(lang) {
+return `intel-lang=${lang}; Path=/; Max-Age=2592000; SameSite=Lax`;
+}
+function channelName(key, lang) {
+const c = CHANNEL_I18N[key];
+return c? (c[lang] || c.zh): key;
+}
+function seedCatName(cat, lang) {
+const c = SEED_CAT_I18N[cat];
+return c? (c[lang] || c.zh): (SEED_CATS[cat] || cat);
+}
+// 标签渲染时翻译：数据层存的仍是中文标签；缺失条目回退中文原文；「<语言> 工程实践」兜底标签按后缀规则拼
+function tagLabel(label, lang) {
+if (!label) return "";
+if (!lang || lang === "zh") return label;
+const tbl = TAG_I18N[lang];
+if (tbl && tbl[label]) return tbl[label];
+const m = /^(.*) 工程实践$/.exec(label);
+if (m) return m[1] + " " + t(lang, "tag_practice_suffix");
+return label;
+}
+function fmtLoc(ts, lang) {
+if (!ts) return "-";
+if (!lang || lang === "zh") return fmtCST(ts);
+try { return new Date(ts).toLocaleString(LANG_LOCALES[lang] || "zh-CN", { timeZone: "Asia/Shanghai", hour12: false }); }
+catch { return fmtCST(ts); }
+}
+function fmtDateLoc(iso, lang) {
+if (!iso) return "-";
+if (!lang || lang === "zh") return fmtDateCST(iso);
+try { return new Date(iso).toLocaleString(LANG_LOCALES[lang] || "zh-CN", { timeZone: "Asia/Shanghai", hour12: false }); }
+catch { return fmtDateCST(iso); }
+}
+function verdictHead(lang, delta) {
+if (typeof delta === "number" && delta > 0) return tpl(t(lang, "verdict_up"), { d: delta });
+if (typeof delta === "number" && delta < 0) return tpl(t(lang, "verdict_down"), { d: delta });
+if (typeof delta === "number") return t(lang, "verdict_flat");
+return t(lang, "verdict_new");
+}
+function composeVerdict(p, lang) {
+const point = tagLabel(p.point || "", lang);
+return verdictHead(lang, typeof p.delta === "number"? p.delta: null) + (p.language? p.language + " ": "") + tpl(t(lang, "verdict_body"), { point });
+}
+// 一句话研判的渲染时拼装：zh 用记录里存的原文（与历史完全一致）；非 zh 有 verdictParts 时按模板拼，
+// 旧记录没有 verdictParts 时用热度/增量/首标签拼一句本地化通用研判——绝不把中文模板句漏到非 zh 界面。
+function renderVerdict(r, lang) {
+if (!r) return "";
+lang = lang && LANGS.includes(lang)? lang: "zh";
+if (lang === "zh") {
+if (r.verdict) return r.verdict;
+if (r.verdictParts) return composeVerdict(r.verdictParts, "zh");
+return "";
+}
+if (r.verdictParts) return composeVerdict(r.verdictParts, lang);
+const topTag = (r.learnTags && r.learnTags[0])? tagLabel(r.learnTags[0], lang): "";
+return verdictHead(lang, typeof r.starDelta === "number"? r.starDelta: null) + tpl(t(lang, "verdict_generic"), { heat: r.heat || 0, tag: topTag });
+}
+
+// ============================================================
 // 【核心模块】总统简报生成 — 从当前情报数据提炼「总统简报」：态势一句话、飙升/热度 TOP3、网安与 Skill 焦点、重点监控动态（规则模板产出，非 AI）
 // ============================================================
-function briefRepo(r) {
+function briefRepo(r, lang) {
 if (!r) return null;
 return {
 name: r.full_name,
@@ -515,7 +1576,7 @@ stars: r.stars || 0,
 heat: r.heat || 0,
 grade: r.grade || "B",
 delta: typeof r.starDelta === "number"? r.starDelta: null,
-verdict: r.verdict || "",
+verdict: renderVerdict(r, lang),
 };
 }
 function secTagFreq(repos) {
@@ -566,14 +1627,15 @@ out.push({ topic, dStars24h: dStars, dCount24h: v.n - old.n, streak});
 }
 return out.sort((a, b) => b.dStars24h - a.dStars24h).slice(0, 5);
 }
-function buildBrief(repos, meta, seedIds, seedLive, topicHist) {
+function buildBrief(repos, meta, seedIds, seedLive, topicHist, lang) {
+lang = lang && LANGS.includes(lang)? lang: "zh";
 repos = Array.isArray(repos)? repos: [];
 const byDelta = repos.filter((r) => typeof r.starDelta === "number").sort((a, b) => b.starDelta - a.starDelta).slice(0, 3);
 const byHeat = [...repos].sort((a, b) => (b.heat || 0) - (a.heat || 0)).slice(0, 3);
 const secRepos = repos.filter((r) => (r.channels || []).some((c) => ["security", "src-hunt"].includes(c)))
 .sort((a, b) => (b.heat || 0) - (a.heat || 0));
 const topSecTags = Object.entries(secTagFreq(repos)).sort((a, b) => b[1] - a[1]).slice(0, 3)
-.map(([tag, count]) => ({ tag, count}));
+.map(([tag, count]) => ({ tag: tagLabel(tag, lang), count}));
 const skillTop = repos.filter((r) => (r.channels || []).includes("skills"))
 .sort((a, b) => (b.heat || 0) - (a.heat || 0))[0] || null;
 const wl = buildWatchlist(repos, seedIds, seedLive);
@@ -594,24 +1656,26 @@ const chOk = meta && meta.channelsOk != null? meta.channelsOk: null;
 const chTotal = meta && meta.channelsTotal != null? meta.channelsTotal: buildChannels().length;
 let oneliner;
 if (!repos.length) {
-oneliner = "情报库尚无数据，执行一次巡检后生成今日态势。";
+oneliner = t(lang, "oneliner_empty");
 } else {
-const p1 = `今日共监控 ${repos.length} 个仓库，本轮新增 ${newCount} 个，巡检通道 ${chOk == null? "-": chOk}/${chTotal} 正常。`;
+const joiner = lang === "zh"? "、": ", ";
+const p1 = tpl(t(lang, "oneliner_p1"), { n: repos.length, new: newCount, ok: chOk == null? "-": chOk, total: chTotal});
 const p2 = byDelta.length && byDelta[0].starDelta > 0
-? `飙升最快的是 ${byDelta[0].full_name}（本轮 +${byDelta[0].starDelta}★）。`
-: byHeat.length? `热度榜首为 ${byHeat[0].full_name}（热度 ${byHeat[0].heat || 0}）。`: "";
+? tpl(t(lang, "oneliner_surge"), { name: byDelta[0].full_name, d: byDelta[0].starDelta})
+: byHeat.length? tpl(t(lang, "oneliner_heat"), { name: byHeat[0].full_name, heat: byHeat[0].heat || 0}): "";
 const p3 = secRepos.length
-? `网安焦点为 ${secRepos[0].full_name}${topSecTags.length? "，热门安全标签：" + topSecTags.map((t) => t.tag).join("、"): ""}。`: "";
+? tpl(t(lang, "oneliner_sec"), { name: secRepos[0].full_name}) + (topSecTags.length? tpl(t(lang, "oneliner_sec_tags"), { tags: topSecTags.map((x) => x.tag).join(joiner)}): "") + t(lang, "oneliner_end"): "";
 oneliner = p1 + p2 + p3;
 }
 return {
-date: fmtCST(Date.now()),
-timeCST: new Date().toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, hour: "2-digit", minute: "2-digit"}),
+lang,
+date: fmtLoc(Date.now(), lang),
+timeCST: new Date().toLocaleTimeString(LANG_LOCALES[lang], { timeZone: "Asia/Shanghai", hour12: false, hour: "2-digit", minute: "2-digit"}),
 totals: { repos: repos.length, newCount, channelsOk: chOk, channelsTotal: chTotal},
-topSurging: byDelta.map(briefRepo),
-topHeat: byHeat.map(briefRepo),
-securityFocus: { top: briefRepo(secRepos[0] || null), topTags: topSecTags},
-skillsFocus: briefRepo(skillTop),
+topSurging: byDelta.map((r) => briefRepo(r, lang)),
+topHeat: byHeat.map((r) => briefRepo(r, lang)),
+securityFocus: { top: briefRepo(secRepos[0] || null, lang), topTags: topSecTags},
+skillsFocus: briefRepo(skillTop, lang),
 watchlistLive: {
 liveCount: liveSeeds.length,
 total: wl.length,
@@ -623,59 +1687,64 @@ trendingTopics: computeTrendingTopics(topicHist),
 oneliner,
 };
 }
-async function loadBrief(env) {
+async function loadBrief(env, lang) {
 const latest = await loadJSON(env, CONFIG.kvLatest, null);
 const meta = await loadJSON(env, CONFIG.kvMeta, null);
 const seedIds = (await loadJSON(env, CONFIG.kvSeedIds, {})) || {};
 const seedLive = (await loadJSON(env, CONFIG.kvSeedLive, {})) || {};
 const topicHist = (await loadJSON(env, CONFIG.kvTopicHist, [])) || [];
 const repos = latest && Array.isArray(latest.repos)? latest.repos: [];
-return buildBrief(repos, meta, seedIds, seedLive, topicHist);
+return buildBrief(repos, meta, seedIds, seedLive, topicHist, lang);
 }
-function briefLine(r, suffix) {
-if (!r) return `<div class="bline muted">暂无数据</div>`;
-return `<div class="bline"><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.name)}</a> <span class="bmeta">★ ${r.stars} · 热度 ${r.heat}${suffix || ""}</span><div class="bverdict">${esc(r.verdict)}</div></div>`;
+function briefLine(r, suffix, lang) {
+lang = lang && LANGS.includes(lang)? lang: "zh";
+if (!r) return `<div class="bline muted">${esc(t(lang, "nodata"))}</div>`;
+return `<div class="bline"><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.name)}</a> <span class="bmeta">${esc(tpl(t(lang, "brief_meta"), { stars: r.stars, heat: r.heat}))}${suffix || ""}</span><div class="bverdict">${esc(r.verdict)}</div></div>`;
 }
 function renderBriefHtml(b) {
-const surge = b.topSurging.length? b.topSurging.map((r) => briefLine(r, typeof r.delta === "number"? ` · ${r.delta >= 0? "+": ""}${r.delta}★ 本轮`: "")).join(""): `<div class="bline muted">暂无增量数据（需两轮巡检）</div>`;
-const heat = b.topHeat.length? b.topHeat.map((r) => briefLine(r)).join(""): `<div class="bline muted">暂无数据</div>`;
-const secTop = b.securityFocus.top? briefLine(b.securityFocus.top): `<div class="bline muted">暂无网安焦点</div>`;
-const secTags = b.securityFocus.topTags.length? `<div class="bline">热门标签：${b.securityFocus.topTags.map((t) => esc(t.tag) + " ×" + t.count).join(" · ")}</div>`: "";
-const skill = b.skillsFocus? briefLine(b.skillsFocus): `<div class="bline muted">暂无 Skill 焦点</div>`;
-const wl = `<div class="bline">已命中实时数据 <b>${b.watchlistLive.liveCount}</b> / ${b.watchlistLive.total} 个种子</div>` +
-(b.watchlistLive.top? `<div class="bline">领跑种子：<a href="${esc(b.watchlistLive.top.url)}" target="_blank" rel="noopener">${esc(b.watchlistLive.top.name)}</a> <span class="bmeta">★ ${b.watchlistLive.top.stars}</span></div>`: "");
-const topicsLine = (b.topTopics && b.topTopics.length)? `<div class="bline">关键词热度：${b.topTopics.map((t) => esc(t.topic) + "（" + t.count + " 仓 · ★" + t.stars + "）").join(" · ")}</div>`: "";
-const trendHtml = (b.trendingTopics && b.trendingTopics.length)? `<h4>【话题趋势】</h4>` + b.trendingTopics.map((t) => `<div class="bline">${esc(t.topic)} <span class="bmeta">+${t.dStars24h}★/24h · 连续 ${t.streak} 轮升温</span></div>`).join(""): "";
-const renameHtml = (b.renames && b.renames.length)? `<h4>【改名动态】</h4>` + b.renames.map((r) => `<div class="bline">改名动态：${esc(r.from)} → <a href="https://github.com/${esc(r.to)}" target="_blank" rel="noopener">${esc(r.to)}</a> <span class="bmeta">★ ${r.stars}</span></div>`).join(""): "";
-return `<h4>【今日态势】</h4><p class="boneliner">${esc(b.oneliner)}</p>${topicsLine}
-${trendHtml}<h4>【飙升 TOP3】</h4>${surge}
-<h4>【热度 TOP3】</h4>${heat}
-<h4>【网安焦点】</h4>${secTop}${secTags}
-<h4>【Skill 焦点】</h4>${skill}
-${renameHtml}<h4>【重点监控动态】</h4>${wl}`;
+const lang = b && b.lang && LANGS.includes(b.lang)? b.lang: "zh";
+const deltaSuffix = (r) => typeof r.delta === "number"? esc(tpl(t(lang, "brief_delta"), { sd: (r.delta >= 0? "+": "") + r.delta})): "";
+const surge = b.topSurging.length? b.topSurging.map((r) => briefLine(r, deltaSuffix(r), lang)).join(""): `<div class="bline muted">${esc(t(lang, "brief_nodata_delta"))}</div>`;
+const heat = b.topHeat.length? b.topHeat.map((r) => briefLine(r, "", lang)).join(""): `<div class="bline muted">${esc(t(lang, "nodata"))}</div>`;
+const secTop = b.securityFocus.top? briefLine(b.securityFocus.top, "", lang): `<div class="bline muted">${esc(t(lang, "brief_no_sec"))}</div>`;
+const secTags = b.securityFocus.topTags.length? `<div class="bline">${esc(t(lang, "brief_hot_tags"))}${b.securityFocus.topTags.map((x) => esc(x.tag) + " ×" + x.count).join(" · ")}</div>`: "";
+const skill = b.skillsFocus? briefLine(b.skillsFocus, "", lang): `<div class="bline muted">${esc(t(lang, "brief_no_skill"))}</div>`;
+const wl = `<div class="bline">${tpl(t(lang, "brief_wl_line"), { live: b.watchlistLive.liveCount, total: b.watchlistLive.total})}</div>` +
+(b.watchlistLive.top? `<div class="bline">${esc(t(lang, "brief_wl_top"))}<a href="${esc(b.watchlistLive.top.url)}" target="_blank" rel="noopener">${esc(b.watchlistLive.top.name)}</a> <span class="bmeta">★ ${b.watchlistLive.top.stars}</span></div>`: "");
+const topicsLine = (b.topTopics && b.topTopics.length)? `<div class="bline">${esc(t(lang, "brief_topics_label"))}${b.topTopics.map((x) => esc(tpl(t(lang, "brief_topic_item"), { topic: x.topic, count: x.count, stars: x.stars}))).join(" · ")}</div>`: "";
+const trendHtml = (b.trendingTopics && b.trendingTopics.length)? `<h4>${esc(t(lang, "brief_trend_t"))}</h4>` + b.trendingTopics.map((x) => `<div class="bline">${esc(x.topic)} <span class="bmeta">${esc(tpl(t(lang, "trend_fmt"), { d: x.dStars24h, n: x.streak}))}</span></div>`).join(""): "";
+const renameHtml = (b.renames && b.renames.length)? `<h4>${esc(t(lang, "brief_rename_t"))}</h4>` + b.renames.map((r) => `<div class="bline">${esc(tpl(t(lang, "brief_rename_line"), { from: r.from}))}<a href="https://github.com/${esc(r.to)}" target="_blank" rel="noopener">${esc(r.to)}</a> <span class="bmeta">★ ${r.stars}</span></div>`).join(""): "";
+return `<h4>${esc(t(lang, "brief_situation"))}</h4><p class="boneliner">${esc(b.oneliner)}</p>${topicsLine}
+${trendHtml}<h4>${esc(t(lang, "brief_surge_t"))}</h4>${surge}
+<h4>${esc(t(lang, "brief_heat_t"))}</h4>${heat}
+<h4>${esc(t(lang, "brief_sec_t"))}</h4>${secTop}${secTags}
+<h4>${esc(t(lang, "brief_skill_t"))}</h4>${skill}
+${renameHtml}<h4>${esc(t(lang, "brief_wl_t"))}</h4>${wl}`;
 }
 
 // ============================================================
 // 【核心模块】情报面板 — 暗色情报中心风格：跑马灯/KPI/飙升榜/专区/全部情报（可筛选可搜索）
 // ============================================================
-function repoCard(r, rank) {
+function repoCard(r, rank, lang) {
+lang = lang && LANGS.includes(lang)? lang: "zh";
 const delta = typeof r.starDelta === "number"
-? `<span class="delta ${r.starDelta >= 0? "up": "down"}">${r.starDelta >= 0? "+": ""}${r.starDelta}★ 本轮</span>`: "";
-const tags = (r.learnTags || []).map((t) => `<button type="button" class="tag tagchip" data-tag="${esc(t)}" title="按此标签筛选全部情报">${esc(t)}</button>`).join("");
+? `<span class="delta ${r.starDelta >= 0? "up": "down"}">${esc(tpl(t(lang, "delta_fmt"), { sd: (r.starDelta >= 0? "+": "") + r.starDelta}))}</span>`: "";
+const tags = (r.learnTags || []).map((tg) => `<button type="button" class="tag tagchip" data-tag="${esc(tg)}" data-taglabel="${esc(tagLabel(tg, lang))}" title="${esc(t(lang, "tag_title"))}">${esc(tagLabel(tg, lang))}</button>`).join("");
 const chans = (r.channels || []).join(" ");
 const rankHtml = rank? `<span class="rank">#${rank}</span>`: "";
 return `<article class="card" data-channels="${esc(chans)}" data-grade="${esc(r.grade || "B")}" data-tags="${esc((r.learnTags || []).join("|"))}" data-name="${esc((r.full_name + " " + (r.description || "")).toLowerCase())}">
-<div class="chead"><span>${rankHtml}<a class="rname" href="${esc(r.html_url)}" target="_blank" rel="noopener">${esc(r.full_name)}</a></span><span class="grade g${esc(r.grade || "B")}">${esc(r.grade || "B")}级</span></div>
-<p class="desc">${esc(r.description || "（无描述）")}</p>
+<div class="chead"><span>${rankHtml}<a class="rname" href="${esc(r.html_url)}" target="_blank" rel="noopener">${esc(r.full_name)}</a></span><span class="grade g${esc(r.grade || "B")}">${esc(tpl(t(lang, "grade_card_fmt"), { g: r.grade || "B"}))}</span></div>
+<p class="desc">${esc(r.description || t(lang, "no_desc"))}</p>
 <div class="meta">★ ${r.stars} · ⑂ ${r.forks}${r.language? " · " + esc(r.language): ""}${r.license? " · " + esc(r.license): ""} ${delta}</div>
 <div class="heatbar"><div class="heatfill" style="width:${r.heat || 0}%"></div></div>
-<div class="meta">热度 ${r.heat || 0} / 100 · 推送 ${fmtDateCST(r.pushed_at)}</div>
+<div class="meta">${esc(tpl(t(lang, "heat_line"), { heat: r.heat || 0, date: fmtDateLoc(r.pushed_at, lang)}))}</div>
 <div class="tags">${tags}</div>
-<p class="verdict">研判（规则）：${esc(r.verdict || "")}</p>
+<p class="verdict">${esc(t(lang, "verdict_prefix"))}${esc(renderVerdict(r, lang))}</p>
 </article>`;
 }
 
-async function renderPanel(env) {
+async function renderPanel(env, lang) {
+lang = lang && LANGS.includes(lang)? lang: "zh";
 const latest = await loadJSON(env, CONFIG.kvLatest, null);
 const meta = await loadJSON(env, CONFIG.kvMeta, null);
 const repos = latest && Array.isArray(latest.repos)? latest.repos: [];
@@ -696,7 +1765,7 @@ const secLearnList = repos.filter((r) => r.channels.includes("sec-learning")).sl
 // 热门标签云：统计安全三通道（security/src-hunt/sec-learning）仓库的标签频次，取前 15
 const tagFreq = secTagFreq(repos);
 const tagCloud = Object.entries(tagFreq).sort((a, b) => b[1] - a[1]).slice(0, 15)
-.map(([t, n]) => `<button type="button" class="tag tagchip cloudchip" data-tag="${esc(t)}" title="按此标签筛选全部情报">${esc(t)} · ${n}</button>`).join("");
+.map(([tag, n]) => `<button type="button" class="tag tagchip cloudchip" data-tag="${esc(tag)}" data-taglabel="${esc(tagLabel(tag, lang))}" title="${esc(t(lang, "tag_title"))}">${esc(tagLabel(tag, lang))} · ${n}</button>`).join("");
 // 全部情报分页：每页 24 条（与 DEAL HUB 约定一致），服务端先渲染初始页码按钮，筛选后由前端重算
 const PAGE_SIZE_SSR = 24;
 const totalPages = Math.max(1, Math.ceil(repos.length / PAGE_SIZE_SSR));
@@ -710,11 +1779,11 @@ const seedIds = (await loadJSON(env, CONFIG.kvSeedIds, {})) || {};
 const seedLive = (await loadJSON(env, CONFIG.kvSeedLive, {})) || {};
 const topicHist = (await loadJSON(env, CONFIG.kvTopicHist, [])) || {};
 const watchlist = buildWatchlist(repos, seedIds, seedLive);
-const brief = buildBrief(repos, meta, seedIds, seedLive, topicHist);
+const brief = buildBrief(repos, meta, seedIds, seedLive, topicHist, lang);
 // 【v5】话题趋势行：紧贴热门标签云下方，一行纯文本 chip（非链接），历史不足两轮时不渲染
 const trending = brief.trendingTopics || [];
-const trendLine = trending.length? `<div class="tagrow"><span class="taglabel">📈 话题趋势</span>${trending.map((t) => `<span class="tag">${esc(t.topic)} +${t.dStars24h}★/24h · 连续 ${t.streak} 轮升温</span>`).join("")}</div>`: "";
-const showMoreBtn = (gid, n) => n > 6? `<button class="btn showmore" type="button" data-showmore="${gid}" data-label="展开全部 ${n} 条 ▾">展开全部 ${n} 条 ▾</button>`: "";
+const trendLine = trending.length? `<div class="tagrow"><span class="taglabel">${esc(t(lang, "trend_label"))}</span>${trending.map((x) => `<span class="tag">${esc(x.topic)} ${esc(tpl(t(lang, "trend_fmt"), { d: x.dStars24h, n: x.streak}))}</span>`).join("")}</div>`: "";
+const showMoreBtn = (gid, n) => n > 6? `<button class="btn showmore" type="button" data-showmore="${gid}" data-label="${esc(tpl(t(lang, "show_more"), { n}))}">${esc(tpl(t(lang, "show_more"), { n}))}</button>`: "";
 const topHeat = repos.length? Math.max(...repos.map((r) => r.heat || 0)): 0;
 const newCount = meta? meta.newCount || 0: 0;
 
@@ -724,32 +1793,32 @@ const items = watchlist.filter((w) => w.cat === cat);
 const cards = items.map((w) => {
 let live;
 if (w.live) {
-live = `<div class="meta">★ ${w.live.stars} · 热度 ${w.live.heat} · ${esc(w.live.grade || "B")}级${typeof w.live.starDelta === "number"? ` · <span class="delta ${w.live.starDelta >= 0? "up": "down"}">${w.live.starDelta >= 0? "+": ""}${w.live.starDelta}★ 本轮</span>`: ""}</div>`;
+live = `<div class="meta">${esc(tpl(t(lang, "seed_live"), { stars: w.live.stars, heat: w.live.heat, grade: tpl(t(lang, "grade_card_fmt"), { g: w.live.grade || "B"})}))}${typeof w.live.starDelta === "number"? ` · <span class="delta ${w.live.starDelta >= 0? "up": "down"}">${esc(tpl(t(lang, "delta_fmt"), { sd: (w.live.starDelta >= 0? "+": "") + w.live.starDelta}))}</span>`: ""}</div>`;
 } else if (w.refreshed) {
-live = `<div class="meta">★ ${w.refreshed.stars} · ⑂ ${w.refreshed.forks} · <span class="delta up">单独保鲜</span> ${esc(fmtCST(w.refreshed.ts))}${w.renamedFrom? ` · <span class="delta down">原 ${esc(w.renamedFrom)} 已改名</span>`: ""}</div>`;
+live = `<div class="meta">★ ${w.refreshed.stars} · ⑂ ${w.refreshed.forks} · <span class="delta up">${esc(t(lang, "seed_refreshed"))}</span> ${esc(fmtLoc(w.refreshed.ts, lang))}${w.renamedFrom? ` · <span class="delta down">${esc(tpl(t(lang, "seed_renamed"), { name: w.renamedFrom}))}</span>`: ""}</div>`;
 } else if (w.gone) {
-live = `<div class="meta">⚠️ 疑似删库/改名未追踪（保鲜检查 ${esc(fmtCST(w.goneTs))}）</div>`;
+live = `<div class="meta">${esc(tpl(t(lang, "seed_gone"), { ts: fmtLoc(w.goneTs, lang)}))}</div>`;
 } else {
-live = `<div class="meta">未在本轮巡检命中 · 点名监控中</div>`;
+live = `<div class="meta">${esc(t(lang, "seed_static"))}</div>`;
 }
-return `<article class="card seed"><div class="chead"><a class="rname" href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.name)}</a><span class="tag">${esc(w.catName)}</span></div>
-<p class="desc">学习点：${esc(w.note)}</p>${live}</article>`;
+return `<article class="card seed"><div class="chead"><a class="rname" href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.name)}</a><span class="tag">${esc(seedCatName(w.cat, lang))}</span></div>
+<p class="desc">${esc(t(lang, "seed_note"))}${esc(w.note)}</p>${live}</article>`;
 }).join("");
-return `<h3 class="seedcat">▸ ${esc(SEED_CATS[cat] || cat)}（${items.length}）</h3><div class="grid">${cards}</div>`;
+return `<h3 class="seedcat">${esc(tpl(t(lang, "seed_group_fmt"), { cat: seedCatName(cat, lang), n: items.length}))}</h3><div class="grid">${cards}</div>`;
 }).join("");
 
 const tickerText = meta
-? `上次巡检 ${fmtCST(meta.ts)} · 监控仓库 ${repos.length} 个 · 本轮新增 ${newCount} · 通道正常 ${meta.channelsOk?? "-"}/${meta.channelsTotal?? channels.length}${Object.keys(meta.errors || {}).length? " · 异常通道：" + Object.keys(meta.errors).join(","): ""} · 数据源 GitHub Search API（未认证限额较低） · 研判为规则引擎产出`
-: "尚无巡检数据 · 点击「立即巡检」或 POST /api/refresh 拉取第一批情报";
+? tpl(t(lang, "ticker_full"), { ts: fmtLoc(meta.ts, lang), n: repos.length, new: newCount, ok: meta.channelsOk?? "-", total: meta.channelsTotal?? channels.length}) + (Object.keys(meta.errors || {}).length? tpl(t(lang, "ticker_err"), { list: Object.keys(meta.errors).join(",")}): "") + t(lang, "ticker_src")
+: t(lang, "ticker_none");
 
 const empty = repos.length === 0
-? `<div class="empty">▣ 情报库为空。先执行一次巡检：点下方按钮，或 <code>POST /api/refresh</code>。未认证 GitHub API 每小时搜索限额有限，请勿频繁刷新（面板刷新有 30 分钟节流）。<br><br><button class="btn" onclick="doRefresh(this)">立即巡检</button> <span class="rmsg"></span></div>`: "";
+? `<div class="empty">${t(lang, "empty_text")}<br><br><button class="btn" onclick="doRefresh(this)">${esc(t(lang, "empty_btn"))}</button> <span class="rmsg"></span></div>`: "";
 
-const filterBtns = [`<button class="fbtn on" data-filter="all">全部</button>`]
-.concat(channels.map((c) => `<button class="fbtn" data-filter="${c.key}">${esc(c.name)}</button>`)).join("");
+const filterBtns = [`<button class="fbtn on" data-filter="all">${esc(t(lang, "filter_all"))}</button>`]
+.concat(channels.map((c) => `<button class="fbtn" data-filter="${c.key}">${esc(channelName(c.key, lang))}</button>`)).join("");
 
-const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GitHub 情报中心 · INTEL CENTER</title><style>
+const html = `<!doctype html><html lang="${LANG_HTML[lang]}"${lang === "ar"? ' dir="rtl"': ""}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(t(lang, "doc_title"))}</title><style>
 *{box-sizing:border-box}body{margin:0;background:#0a0e12;color:#c9f7d4;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
 background-image:linear-gradient(rgba(0,255,170,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,170,.04) 1px,transparent 1px);background-size:36px 36px}
 body:after{content:"";position:fixed;inset:0;pointer-events:none;background:repeating-linear-gradient(0deg,rgba(255,255,255,.015) 0 1px,transparent 1px 3px)}
@@ -833,84 +1902,90 @@ h2.sechead:hover{color:#a5f3fc}
 .bmeta{color:#6ee7b7;font-size:12px}
 .bverdict{color:#fef08a;font-size:12px;line-height:1.5}
 .brief-foot{padding:8px 14px;border-top:1px dashed #14532d;color:#5f7a68;font-size:12px}
+.langbar{margin-top:7px;display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+.langbar a{color:#4ade80;border:1px solid #14532d;border-radius:4px;padding:1px 7px;text-decoration:none;font-size:12px}
+.langbar a:hover{border-color:#22c55e}
+.langbar a.on{background:#22c55e;color:#04120a;font-weight:700}
+html[dir="rtl"].verdict{border-left:none;border-right:3px solid #facc15;padding-left:0;padding-right:9px}
 @media (max-width:520px){#brief-panel{width:92vw}}
 </style></head><body><div class="wrap">
 <div class="stickyhead">
 <div class="topbar"><div class="toprow">
-<div><h1>◢ GitHub 情报中心</h1><div class="sub">GITHUB INTEL CENTER // 开源情报巡检 · 规则研判 · 非 AI 生成</div></div>
-<div class="clockbox"><div>北京时间 CST <b id="clock">--:--:--</b></div><div>巡检状态：${meta? (meta.ok? "✅ 正常": "⚠️ 异常") + " · " + esc(fmtCST(meta.ts)): "尚无数据"} · 通道 ${meta? (meta.channelsOk?? "-"): "-"}/${channels.length}</div><button class="fbtn" id="head-toggle" type="button">收起工具栏 ▴</button></div>
+<div><h1>${esc(t(lang, "h1"))}</h1><div class="sub">${esc(t(lang, "tagline"))}</div></div>
+<div class="clockbox"><div>${esc(t(lang, "clock_label"))} <b id="clock">--:--:--</b></div><div>${esc(t(lang, "status_label"))}${meta? (meta.ok? esc(t(lang, "status_ok")): esc(t(lang, "status_warn"))) + " · " + esc(fmtLoc(meta.ts, lang)): esc(t(lang, "status_none"))}${esc(tpl(t(lang, "channels_part"), { ok: meta? (meta.channelsOk?? "-"): "-", total: channels.length}))}</div><button class="fbtn" id="head-toggle" type="button">${esc(t(lang, "toggle_collapse"))}</button><div class="langbar">${LANGS.map((l) => `<a href="/?lang=${l}"${l === lang? ' class="on"': ""}>${LANG_SHORT[l]}</a>`).join("")}</div></div>
 </div></div>
-<div class="tagrow" id="tag-cloud"><span class="taglabel">🏷 热门标签（点标签筛选全部情报）</span>${tagCloud || '<span class="muted">暂无标签数据</span>'}</div>
+<div class="tagrow" id="tag-cloud"><span class="taglabel">${esc(t(lang, "tagcloud_label"))}</span>${tagCloud || `<span class="muted">${esc(t(lang, "tagcloud_empty"))}</span>`}</div>
 <div class="filterbar"><div>${filterBtns}</div>
-<div><button class="fbtn on" data-gf="all">评级 全部</button><button class="fbtn" data-gf="S">S 级</button><button class="fbtn" data-gf="A">A 级</button><button class="fbtn" data-gf="B">B 级</button><input type="search" id="q" placeholder="🔍 搜仓库名 / 描述 / 语言"><span class="muted" id="shown"></span><span id="tag-pill" class="tagpill" style="display:none">标签：<b id="tag-name"></b> <button class="fbtn" id="tag-clear" type="button">✕ 清除标签</button></span></div><div style="margin-top:6px"><button class="fbtn" id="btn-expand-all" type="button">全部展开</button><button class="fbtn" id="btn-collapse-all" type="button">全部收起</button></div></div>
+<div><button class="fbtn on" data-gf="all">${esc(t(lang, "grade_all"))}</button><button class="fbtn" data-gf="S">${esc(tpl(t(lang, "grade_btn_fmt"), { g: "S"}))}</button><button class="fbtn" data-gf="A">${esc(tpl(t(lang, "grade_btn_fmt"), { g: "A"}))}</button><button class="fbtn" data-gf="B">${esc(tpl(t(lang, "grade_btn_fmt"), { g: "B"}))}</button><input type="search" id="q" placeholder="${esc(t(lang, "search_ph"))}"><span class="muted" id="shown"></span><span id="tag-pill" class="tagpill" style="display:none">${esc(t(lang, "pill_label"))}<b id="tag-name"></b> <button class="fbtn" id="tag-clear" type="button">${esc(t(lang, "pill_clear"))}</button></span></div><div style="margin-top:6px"><button class="fbtn" id="btn-expand-all" type="button">${esc(t(lang, "expand_all"))}</button><button class="fbtn" id="btn-collapse-all" type="button">${esc(t(lang, "collapse_all"))}</button></div></div>
 </div>
 <div class="ticker"><span>${esc(tickerText)} &nbsp;///&nbsp; ${esc(tickerText)}</span></div>
 <div class="kpis">
-<div class="kpi"><span>监控仓库数</span><b>${repos.length}</b></div>
-<div class="kpi"><span>本轮新增</span><b>${newCount}</b></div>
-<div class="kpi"><span>最高热度</span><b>${topHeat}</b></div>
-<div class="kpi"><span>情报通道数</span><b>${channels.length}</b></div>
-<div class="kpi"><span>重点监控种子</span><b>${SEEDS.length}</b></div>
-<div class="kpi"><span>上次巡检 (CST)</span><b style="font-size:15px;padding-top:8px">${meta? esc(fmtCST(meta.ts)): "-"}</b></div>
+<div class="kpi"><span>${esc(t(lang, "kpi_repos"))}</span><b>${repos.length}</b></div>
+<div class="kpi"><span>${esc(t(lang, "kpi_new"))}</span><b>${newCount}</b></div>
+<div class="kpi"><span>${esc(t(lang, "kpi_heat"))}</span><b>${topHeat}</b></div>
+<div class="kpi"><span>${esc(t(lang, "kpi_channels"))}</span><b>${channels.length}</b></div>
+<div class="kpi"><span>${esc(t(lang, "kpi_seeds"))}</span><b>${SEEDS.length}</b></div>
+<div class="kpi"><span>${esc(t(lang, "kpi_last"))}</span><b style="font-size:15px;padding-top:8px">${meta? esc(fmtLoc(meta.ts, lang)): "-"}</b></div>
 </div>
 <div>
-<button class="btn" onclick="doRefresh(this)">↻ 立即巡检（30 分钟节流）</button> <span class="rmsg muted"></span>
+<button class="btn" onclick="doRefresh(this)">${esc(t(lang, "refresh_btn"))}</button> <span class="rmsg muted"></span>
 <a class="btn" href="/api/repos" style="text-decoration:none">/api/repos</a>
 <a class="btn" href="/api/stats" style="text-decoration:none">/api/stats</a>
 </div>
 ${empty}
-<h2>◢ 情报总览 INTEL OVERVIEW</h2>
-<p class="muted">本面板追踪 GitHub 热门仓库：飙升榜按本轮星标增量排序（需至少两轮巡检才有增量），其余按热度分排序。热度分 = 星标规模 + 本轮增量 + 推送新鲜度 + fork 活跃度的规则加权；学习点为关键词规则映射；评级 S ≥70、A ≥45、B 其余。</p>
+<h2>${esc(t(lang, "overview_title"))}</h2>
+<p class="muted">${esc(t(lang, "overview_para"))}</p>
 ${trendLine}
-<h2 class="sechead" data-collapse="sec-surge"><span>◢ 飙升榜 STAR SURGE</span><span class="ctog">▼</span></h2>
-<div class="secbody" id="sec-surge"><div class="grid showcase${surgeList.length > 6? " clipped": ""}" id="g-surge">${surgeList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-surge", surgeList.length)}</div>
-<h2 class="sechead" data-collapse="sec-newstars"><span>◢ 热门新星 NEW STARS</span><span class="ctog">▼</span></h2>
-<div class="secbody" id="sec-newstars"><div class="grid showcase${newStars.length > 6? " clipped": ""}" id="g-newstars">${newStars.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-newstars", newStars.length)}</div>
-<h2 class="sechead" data-collapse="sec-ai"><span>◢ AI / AGENT 专区</span><span class="ctog">▼</span></h2>
-<div class="secbody" id="sec-ai"><div class="grid showcase${aiList.length > 6? " clipped": ""}" id="g-ai">${aiList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-ai", aiList.length)}</div>
-<h2 class="sechead" data-collapse="sec-security"><span>◢ 网安 · 红队 · SRC 情报 SECURITY INTEL</span><span class="ctog">▼</span></h2>
+<h2 class="sechead" data-collapse="sec-surge"><span>${esc(t(lang, "sec_surge"))}</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-surge"><div class="grid showcase${surgeList.length > 6? " clipped": ""}" id="g-surge">${surgeList.map((r, i) => repoCard(r, i + 1, lang)).join("") || ('<p class="muted">' + esc(t(lang, "nodata")) + '</p>')}</div>${showMoreBtn("g-surge", surgeList.length)}</div>
+<h2 class="sechead" data-collapse="sec-newstars"><span>${esc(t(lang, "sec_newstars"))}</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-newstars"><div class="grid showcase${newStars.length > 6? " clipped": ""}" id="g-newstars">${newStars.map((r, i) => repoCard(r, i + 1, lang)).join("") || ('<p class="muted">' + esc(t(lang, "nodata")) + '</p>')}</div>${showMoreBtn("g-newstars", newStars.length)}</div>
+<h2 class="sechead" data-collapse="sec-ai"><span>${esc(t(lang, "sec_ai"))}</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-ai"><div class="grid showcase${aiList.length > 6? " clipped": ""}" id="g-ai">${aiList.map((r, i) => repoCard(r, i + 1, lang)).join("") || ('<p class="muted">' + esc(t(lang, "nodata")) + '</p>')}</div>${showMoreBtn("g-ai", aiList.length)}</div>
+<h2 class="sechead" data-collapse="sec-security"><span>${esc(t(lang, "sec_security"))}</span><span class="ctog">▼</span></h2>
 <div class="secbody" id="sec-security">
-<div class="grid showcase${secList.length > 6? " clipped": ""}" id="g-sec">${secList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-sec", secList.length)}</div>
-<h2 class="sechead" data-collapse="sec-src"><span>◢ SRC · 挖洞 SRC HUNTING</span><span class="ctog">▼</span></h2>
-<div class="secbody" id="sec-src"><div class="grid showcase${srcList.length > 6? " clipped": ""}" id="g-src">${srcList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-src", srcList.length)}</div>
-<h2 class="sechead" data-collapse="sec-seclearn"><span>◢ 网安学习资料 SECURITY LEARNING</span><span class="ctog">▼</span></h2>
-<div class="secbody" id="sec-seclearn"><div class="grid showcase${secLearnList.length > 6? " clipped": ""}" id="g-seclearn">${secLearnList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-seclearn", secLearnList.length)}</div>
-<h2 class="sechead" data-collapse="sec-skills"><span>◢ Skill 生态 SKILL ECOSYSTEM</span><span class="ctog">▼</span></h2>
-<div class="secbody" id="sec-skills"><div class="grid showcase${skillList.length > 6? " clipped": ""}" id="g-skills">${skillList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-skills", skillList.length)}</div>
-<h2 class="sechead" data-collapse="sec-creator"><span>◢ 自媒体全套 CREATOR TOOLKIT</span><span class="ctog">▼</span></h2>
-<div class="secbody" id="sec-creator"><div class="grid showcase${creatorList.length > 6? " clipped": ""}" id="g-creator">${creatorList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-creator", creatorList.length)}</div>
-<h2 class="sechead" data-collapse="sec-watchlist"><span>◢ 重点监控 WATCHLIST</span><span class="ctog">▼</span></h2>
+<div class="grid showcase${secList.length > 6? " clipped": ""}" id="g-sec">${secList.map((r, i) => repoCard(r, i + 1, lang)).join("") || ('<p class="muted">' + esc(t(lang, "nodata")) + '</p>')}</div>${showMoreBtn("g-sec", secList.length)}</div>
+<h2 class="sechead" data-collapse="sec-src"><span>${esc(t(lang, "sec_src"))}</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-src"><div class="grid showcase${srcList.length > 6? " clipped": ""}" id="g-src">${srcList.map((r, i) => repoCard(r, i + 1, lang)).join("") || ('<p class="muted">' + esc(t(lang, "nodata")) + '</p>')}</div>${showMoreBtn("g-src", srcList.length)}</div>
+<h2 class="sechead" data-collapse="sec-seclearn"><span>${esc(t(lang, "sec_seclearn"))}</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-seclearn"><div class="grid showcase${secLearnList.length > 6? " clipped": ""}" id="g-seclearn">${secLearnList.map((r, i) => repoCard(r, i + 1, lang)).join("") || ('<p class="muted">' + esc(t(lang, "nodata")) + '</p>')}</div>${showMoreBtn("g-seclearn", secLearnList.length)}</div>
+<h2 class="sechead" data-collapse="sec-skills"><span>${esc(t(lang, "sec_skills"))}</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-skills"><div class="grid showcase${skillList.length > 6? " clipped": ""}" id="g-skills">${skillList.map((r, i) => repoCard(r, i + 1, lang)).join("") || ('<p class="muted">' + esc(t(lang, "nodata")) + '</p>')}</div>${showMoreBtn("g-skills", skillList.length)}</div>
+<h2 class="sechead" data-collapse="sec-creator"><span>${esc(t(lang, "sec_creator"))}</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-creator"><div class="grid showcase${creatorList.length > 6? " clipped": ""}" id="g-creator">${creatorList.map((r, i) => repoCard(r, i + 1, lang)).join("") || ('<p class="muted">' + esc(t(lang, "nodata")) + '</p>')}</div>${showMoreBtn("g-creator", creatorList.length)}</div>
+<h2 class="sechead" data-collapse="sec-watchlist"><span>${esc(t(lang, "sec_watchlist"))}</span><span class="ctog">▼</span></h2>
 <div class="secbody" id="sec-watchlist">
-<p class="muted">人工精选种子清单（已预筛）：Skill 生态 / 写作 / 科研 / 自媒体 / 网安五类。种子若被本轮巡检命中，卡片会带其实时 ★、热度与本轮增量；未命中的种子由巡检按游标轮换「单独保鲜」（每轮最多 3 个，卡片标注保鲜时间），保鲜时发现改名会显示当前名、404 会标注疑似删库；都还没轮到的标注「点名监控中」。种子学习点为人工研判，与规则研判区分。</p>
+<p class="muted">${esc(t(lang, "watchlist_para"))}</p>
 ${seedGroups}
 </div>
-<h2 id="all-intel" class="sechead" data-collapse="sec-all"><span>◢ 全部情报 ALL INTEL</span><span class="ctog">▼</span></h2>
+<h2 id="all-intel" class="sechead" data-collapse="sec-all"><span>${esc(t(lang, "sec_all"))}</span><span class="ctog">▼</span></h2>
 <div class="secbody" id="sec-all">
-<div class="pager prominent" id="pager-top"><button class="fbtn pg-prev" type="button">← 上一页</button><span class="pg-nums">${pagerBtns}</span><button class="fbtn pg-next" type="button">下一页 →</button><span class="muted pg-status"></span></div>
-<div class="grid" id="all-grid">${repos.map((r, i) => repoCard(r, i + 1)).join("")}</div>
-<div class="pager prominent" id="pager-bottom"><button class="fbtn pg-prev" type="button">← 上一页</button><span class="pg-nums">${pagerBtns}</span><button class="fbtn pg-next" type="button">下一页 →</button><span class="muted pg-status"></span></div>
-<p class="muted">数据源：GitHub Search API（公开接口，未认证时限额约 10 次/分钟、每小时搜索配额有限；配置 GITHUB_TOKEN 可提高）。星标增量需至少两轮巡检对比快照得出，第一轮均为「新入情报库」。本站研判均为规则引擎产出，重点监控种子的学习点为人工撰写，均不构成推荐结论。</p>
+<div class="pager prominent" id="pager-top"><button class="fbtn pg-prev" type="button">${esc(t(lang, "pager_prev"))}</button><span class="pg-nums">${pagerBtns}</span><button class="fbtn pg-next" type="button">${esc(t(lang, "pager_next"))}</button><span class="muted pg-status"></span></div>
+<div class="grid" id="all-grid">${repos.map((r, i) => repoCard(r, i + 1, lang)).join("")}</div>
+<div class="pager prominent" id="pager-bottom"><button class="fbtn pg-prev" type="button">${esc(t(lang, "pager_prev"))}</button><span class="pg-nums">${pagerBtns}</span><button class="fbtn pg-next" type="button">${esc(t(lang, "pager_next"))}</button><span class="muted pg-status"></span></div>
+<p class="muted">${esc(t(lang, "all_foot"))}</p>
 </div>
 </div>
-<button id="brief-fab" type="button">📋 总统简报</button>
+<button id="brief-fab" type="button">${esc(t(lang, "brief_fab"))}</button>
 <div id="brief-panel" style="display:none">
-<div id="brief-head"><span>📋 总统简报 · DAILY BRIEF</span><span><button id="brief-min" type="button" title="最小化">—</button><button id="brief-close" type="button" title="关闭">✕</button></span></div>
+<div id="brief-head"><span>${esc(t(lang, "brief_head"))}</span><span><button id="brief-min" type="button" title="${esc(t(lang, "brief_min"))}">—</button><button id="brief-close" type="button" title="${esc(t(lang, "brief_close"))}">✕</button></span></div>
 <div id="brief-body">${renderBriefHtml(brief)}</div>
-<div class="brief-foot">生成于 ${esc(brief.timeCST)} CST · 规则引擎（非 AI 生成）</div>
+<div class="brief-foot">${esc(tpl(t(lang, "brief_foot"), { time: brief.timeCST}))}</div>
 </div>
 <script type="application/json" id="brief-data">${JSON.stringify(brief).replace(/</g, "\\u003c")}</script>
+<script>var I18N=${JSON.stringify({ refreshing: t(lang, "js_refreshing"), throttled: t(lang, "js_throttled"), fail: t(lang, "js_fail"), expand: t(lang, "toggle_expand"), collapse: t(lang, "toggle_collapse"), pager: t(lang, "js_pager"), shown: t(lang, "js_shown"), showLess: t(lang, "show_less"), locale: LANG_LOCALES[lang]}).replace(/</g, "\\u003c")};</script>
 <script>
 function doRefresh(btn){
-var msg=document.querySelector(".rmsg"); if(msg) msg.textContent="巡检中…（约需数秒）";
+var msg=document.querySelector(".rmsg"); if(msg) msg.textContent=I18N.refreshing;
 if(btn) btn.disabled=true;
 fetch("/api/refresh",{method:"POST"}).then(function(r){return r.json()}).then(function(j){
-if(j.throttled){ if(msg) msg.textContent="已节流：距上次巡检不足 30 分钟，稍后再试。"; if(btn) btn.disabled=false; return;}
+if(j.throttled){ if(msg) msg.textContent=I18N.throttled; if(btn) btn.disabled=false; return;}
 location.reload();
-}).catch(function(e){ if(msg) msg.textContent="巡检失败："+e; if(btn) btn.disabled=false;});
+}).catch(function(e){ if(msg) msg.textContent=I18N.fail+e; if(btn) btn.disabled=false;});
 }
-function tickClock(){ var el=document.getElementById("clock"); if(el) el.textContent=new Date().toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false}); }
+function tickClock(){ var el=document.getElementById("clock"); if(el) el.textContent=new Date().toLocaleString(I18N.locale,{timeZone:"Asia/Shanghai",hour12:false}); }
 tickClock(); setInterval(tickClock, 1000);
-var curFilter="all", curGrade="all", curTag="", curPage=1;
+var curFilter="all", curGrade="all", curTag="", curTagLabel="", curPage=1;
 var PAGE_SIZE = 24;
 function cardMatches(c){
 var q=(document.getElementById("q").value||"").toLowerCase().trim();
@@ -940,7 +2015,7 @@ nums.querySelectorAll("[data-page]").forEach(function(b){ b.addEventListener("cl
 curPage=parseInt(b.dataset.page,10); applyFilter(false); scrollAll();
 });});}
 var st=pg.querySelector(".pg-status");
-if(st) st.textContent="第 "+curPage+" / "+pages+" 页 · 共 "+total+" 条（筛选后）";
+if(st) st.textContent=I18N.pager.replace("{cur}",curPage).replace("{pages}",pages).replace("{total}",total);
 var pv=pg.querySelector(".pg-prev"), nx=pg.querySelector(".pg-next");
 if(pv) pv.disabled=curPage<=1;
 if(nx) nx.disabled=curPage>=pages;
@@ -954,9 +2029,9 @@ var pages=Math.max(1, Math.ceil(list.length/PAGE_SIZE));
 if(curPage>pages) curPage=pages;
 all.forEach(function(c){ c.style.display="none";});
 list.slice((curPage-1)*PAGE_SIZE, curPage*PAGE_SIZE).forEach(function(c){ c.style.display="";});
-document.getElementById("shown").textContent=" 当前显示 "+list.length+" 个";
+document.getElementById("shown").textContent=I18N.shown.replace("{n}",list.length);
 var pill=document.getElementById("tag-pill");
-if(curTag){ pill.style.display=""; document.getElementById("tag-name").textContent=curTag;} else { pill.style.display="none";}
+if(curTag){ pill.style.display=""; document.getElementById("tag-name").textContent=curTagLabel || curTag;} else { pill.style.display="none";}
 renderPager(list.length, pages);
 }
 document.querySelectorAll("[data-filter]").forEach(function(b){ b.addEventListener("click", function(){
@@ -971,9 +2046,9 @@ b.classList.add("on"); applyFilter(true);
 });});
 document.getElementById("q").addEventListener("input", function(){ applyFilter(true);});
 document.querySelectorAll("[data-tag]").forEach(function(ch){ ch.addEventListener("click", function(){
-curTag=ch.dataset.tag; applyFilter(true); scrollAll();
+curTag=ch.dataset.tag; curTagLabel=ch.dataset.taglabel || ch.dataset.tag; applyFilter(true); scrollAll();
 });});
-document.getElementById("tag-clear").addEventListener("click", function(){ curTag=""; applyFilter(true);});
+document.getElementById("tag-clear").addEventListener("click", function(){ curTag=""; curTagLabel=""; applyFilter(true);});
 document.querySelectorAll(".pg-prev").forEach(function(b){ b.addEventListener("click", function(){ if(curPage>1){ curPage--; applyFilter(false); scrollAll(); }});});
 document.querySelectorAll(".pg-next").forEach(function(b){ b.addEventListener("click", function(){ curPage++; applyFilter(false); scrollAll(); });});
 var collapsed={};
@@ -987,7 +2062,7 @@ document.querySelectorAll("[data-collapse]").forEach(function(h){ h.addEventList
 var id=h.dataset.collapse; setSection(id, !collapsed[id]);
 });});
 var headTgl=document.getElementById("head-toggle"), stickyHead=document.querySelector(".stickyhead");
-function setHeadCollapsed(c){ if(!stickyHead) return; stickyHead.classList.toggle("collapsed", !!c); if(headTgl) headTgl.textContent=c? "展开工具栏 ▾": "收起工具栏 ▴"; try{ localStorage.setItem("ih-head", c? "1": "0"); }catch(e){} }
+function setHeadCollapsed(c){ if(!stickyHead) return; stickyHead.classList.toggle("collapsed", !!c); if(headTgl) headTgl.textContent=c? I18N.expand: I18N.collapse; try{ localStorage.setItem("ih-head", c? "1": "0"); }catch(e){} }
 if(headTgl) headTgl.addEventListener("click", function(){ setHeadCollapsed(!stickyHead.classList.contains("collapsed")); });
 try{ if(localStorage.getItem("ih-head")==="1") setHeadCollapsed(true); }catch(e){}
 var btnExp=document.getElementById("btn-expand-all"), btnCol=document.getElementById("btn-collapse-all");
@@ -996,7 +2071,7 @@ if(btnCol) btnCol.addEventListener("click", function(){ document.querySelectorAl
 document.querySelectorAll("[data-showmore]").forEach(function(b){ b.addEventListener("click", function(){
 var g=document.getElementById(b.dataset.showmore); if(!g) return;
 var clipped=g.classList.toggle("clipped");
-b.textContent=clipped? b.dataset.label: "收起 ▴";
+b.textContent=clipped? b.dataset.label: I18N.showLess;
 });});
 var briefPanel=document.getElementById("brief-panel");
 function closeBrief(){ if(briefPanel) briefPanel.style.display="none"; }
@@ -1027,10 +2102,11 @@ applyFilter(false);
 return new Response(html, { headers: { "content-type": "text/html;charset=utf-8"}});
 }
 
-function kvErrorPage() {
-const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>配置错误</title>
+function kvErrorPage(lang) {
+lang = lang && LANGS.includes(lang)? lang: "zh";
+const html = `<!doctype html><html lang="${LANG_HTML[lang]}"${lang === "ar"? ' dir="rtl"': ""}><head><meta charset="utf-8"><title>${esc(t(lang, "kv_err_title"))}</title>
 <style>body{background:#0a0e12;color:#f87171;font-family:ui-monospace,Menlo,Consolas,monospace;padding:40px}</style></head>
-<body><h1>◢ 配置错误</h1><p>KV 未绑定：请给本 Worker 绑定 KV namespace，变量名必须为 <b>INTEL_KV</b>，然后重新部署。</p></body></html>`;
+<body><h1>${esc(t(lang, "kv_err_h1"))}</h1><p>${t(lang, "kv_err_body")}</p></body></html>`;
 return new Response(html, { status: 500, headers: { "content-type": "text/html;charset=utf-8"}});
 }
 
@@ -1380,20 +2456,21 @@ return new Response("ok");
 // ============================================================
 // 【核心模块】路由入口 — 面板、JSON 接口、TG 命令 Webhook、手动刷新（节流）、Cron 巡检
 // ============================================================
-async function handleFetch(request, env) {
+async function handleFetch(request, env, langInfo) {
+const lang = langInfo && LANGS.includes(langInfo.lang)? langInfo.lang: "zh";
 const url = new URL(request.url);
 if (!env.INTEL_KV) {
 if (url.pathname.startsWith("/api/")) return Response.json({ ok: false, error: "KV 未绑定：请绑定变量名 INTEL_KV"}, { status: 500});
-return kvErrorPage();
+return kvErrorPage(lang);
 }
-if (url.pathname === "/" && request.method === "GET") return renderPanel(env);
+if (url.pathname === "/" && request.method === "GET") return renderPanel(env, lang);
 if (url.pathname === "/api/repos" && request.method === "GET") {
 const latest = await loadJSON(env, CONFIG.kvLatest, { ts: 0, repos: []});
 const repos = latest.repos || [];
 return Response.json({ ok: true, ts: latest.ts || 0, count: repos.length, repos, watchlist: buildWatchlist(repos, (await loadJSON(env, CONFIG.kvSeedIds, {})) || {}, (await loadJSON(env, CONFIG.kvSeedLive, {})) || {})});
 }
 if (url.pathname === "/api/brief" && request.method === "GET") {
-const brief = await loadBrief(env);
+const brief = await loadBrief(env, lang);
 const bpRaw = (await loadJSON(env, CONFIG.kvBriefPush, {})) || {};
 const bp = migrateBriefPushState(env, bpRaw);
 const allTargets = await resolvePushTargets(env);
@@ -1465,16 +2542,18 @@ return new Response("not found", { status: 404});
 // 情报数据只在巡检时变化，故缓存 30 分钟且巡检后主动失效，重复访问不再重跑渲染、不再重读 KV（抗刷、省额度）。
 // 存入的副本不带 x-intel-cache 标记：命中时在返回副本上标 HIT，未命中标 MISS。空数据状态（首轮巡检前）与错误响应永不缓存；
 // caches 不可用（如本地测试环境）时自动降级为直读 KV，行为与无缓存时完全一致。
+// 【v5.5】面板与 /api/brief 的缓存键带解析后的语言（?lang=），八种语言各存一份，巡检失效时全部语言变体一并删除；Set-Cookie 只写返回响应、永不进入缓存副本。
 // ============================================================
 const CACHE_PATHS = ["/", "/api/repos", "/api/stats", "/api/brief", "/api/tg/commands"];
+const LANG_CACHE_PATHS = ["/", "/api/brief"];
 
 function intelCache() {
 try { return (typeof caches !== "undefined" && caches.default)? caches.default: null; } catch { return null; }
 }
 
 // 缓存键只取 origin + pathname：这些路由不看 query，忽略 query 差异，避免用 query 刷出大量缓存碎片
-function intelCacheKey(url) {
-return url.origin + url.pathname;
+function intelCacheKey(url, lang) {
+return url.origin + url.pathname + (LANG_CACHE_PATHS.includes(url.pathname)? "?lang=" + (lang || "zh"): "");
 }
 
 // 是否值得缓存：仅 200 且确有情报数据。判断只读响应副本、不额外读 KV。
@@ -1501,33 +2580,45 @@ return !html.includes('class="empty"');
 async function purgeIntelCache(base) {
 const cache = intelCache();
 if (!cache || !base) return;
-await Promise.all(CACHE_PATHS.map(async (p) => {
-try { await cache.delete(new URL(p, base).toString()); } catch {}
+const keys = [];
+for (const p of CACHE_PATHS) {
+if (LANG_CACHE_PATHS.includes(p)) { for (const l of LANGS) keys.push(p + "?lang=" + l);}
+else keys.push(p);
+}
+await Promise.all(keys.map(async (p) => {
+try { await cache.delete(new URL(p, base).toString());} catch {}
 }));
 }
 
 export default {
 async fetch(request, env, ctx) {
 const url = new URL(request.url);
+const langInfo = resolveLang(request);
 const cache = (request.method === "GET" && env.INTEL_KV && CACHE_PATHS.includes(url.pathname))? intelCache(): null;
-if (!cache) return handleFetch(request, env);
-const key = intelCacheKey(url);
+if (!cache) {
+const res = await handleFetch(request, env, langInfo);
+if (langInfo.setCookie && url.pathname === "/") res.headers.set("Set-Cookie", langCookieValue(langInfo.lang));
+return res;
+}
+const key = intelCacheKey(url, langInfo.lang);
 try {
 const hit = await cache.match(key);
 if (hit) {
 const out = new Response(hit.body, hit);
 out.headers.set("x-intel-cache", "HIT");
+if (langInfo.setCookie && url.pathname === "/") out.headers.set("Set-Cookie", langCookieValue(langInfo.lang));
 return out;
 }
 } catch {}
-const res = await handleFetch(request, env);
+const res = await handleFetch(request, env, langInfo);
 if (await intelCacheWorthStoring(url.pathname, res)) {
 res.headers.set("Cache-Control", "public, max-age=" + CONFIG.cacheTtlSec);
-const stored = res.clone(); // 先克隆再给返回响应标 MISS，保证存入的副本不带 x-intel-cache 标记
+const stored = res.clone(); // 先克隆再给返回响应标 MISS/Set-Cookie，保证存入的副本既不带 x-intel-cache 标记、也不带 Set-Cookie
 const putP = Promise.resolve().then(() => cache.put(key, stored)).catch(() => {});
 if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(putP);
 }
 res.headers.set("x-intel-cache", "MISS");
+if (langInfo.setCookie && url.pathname === "/") res.headers.set("Set-Cookie", langCookieValue(langInfo.lang));
 return res;
 },
 async scheduled(event, env, ctx) {
