@@ -1,5 +1,5 @@
 // ============================================================
-// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试；v5.2：Telegram Bot 命令系统）
+// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试；v5.2：Telegram Bot 命令系统；v5.3：频道自动注册——Bot 被设为频道管理员后经 my_chat_member/channel_post 自动登记为推送目标）
 // 单文件 Cloudflare Worker：定时巡检 GitHub 热门仓库，做规则研判（热度/学习点/评级），
 // 以「黑客情报中心」风格暗色面板呈现。零依赖，数据存 KV（绑定名 INTEL_KV）。
 // 研判为规则引擎产出，非 AI 生成，面板与代码均如实标注「规则研判」。
@@ -21,6 +21,7 @@ kvSeedLive: "intel:seedlive",
 kvTopicHist: "intel:topichist",
 kvBriefPush: "intel:briefpush",
 kvPushManual: "intel:pushmanual",
+kvTgChannels: "intel:tgchannels",
 panelUrl: "https://github-intel-hub.u20261103.workers.dev", // 总统简报推送里的面板链接（换部署地址时改这里）
 pushThrottleMs: 6 * 3600 * 1000, // 手动推送 /api/brief/push 的节流：6 小时最多 1 次
 };
@@ -1033,9 +1034,11 @@ return new Response(html, { status: 500, headers: { "content-type": "text/html;c
 }
 
 // ============================================================
-// 【核心模块】总统简报 Telegram 推送 — 可选 Secret：TG_BOT_TOKEN + TG_CHAT_ID（Bot 私聊）和/或 TG_CHANNEL_ID（频道，可填 @频道名 或 -100… 数字 id）；
-// 都未配置时功能静默不启用。每日一次门禁按目标分别判定：失败的目标可在当天后续巡检重试，已成功的目标当天不重发。
-// 推送状态存 intel:briefpush：{date, dm:{ok,ts}, channel:{ok,ts}}。注意：推频道时 Bot 必须是该频道管理员，否则 Telegram 会拒绝。
+// 【核心模块】总统简报 Telegram 推送 — 可选 Secret：TG_BOT_TOKEN + TG_CHAT_ID（Bot 私聊）和/或 TG_CHANNEL_ID（手动频道，可填 @频道名 或 -100… 数字 id）；
+// v5.3 起频道可自动注册：Bot 被设为频道管理员后，Webhook 的 my_chat_member / channel_post 更新会把频道登记进 intel:tgchannels，自动成为推送目标，TG_CHANNEL_ID 退为可选手动覆盖。
+// 都未配置/未注册时功能静默不启用。每日一次门禁按目标分别判定：失败的目标可在当天后续巡检重试，已成功的目标当天不重发。
+// 推送状态存 intel:briefpush：{date, targets: {"dm"|"ch:<chatId>": {ok,ts}}}（v5.2 及更早的 {date, dm, channel} 旧格式在读取时自动迁移）。
+// 注意：推频道时 Bot 必须是该频道管理员，否则 Telegram 会拒绝。
 // ============================================================
 function cstParts(ts) {
 const parts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23"}).formatToParts(new Date(ts));
@@ -1047,11 +1050,56 @@ function cstDateStr(ts) {
 const p = cstParts(ts);
 return `${p.y}-${p.mo}-${p.d}`;
 }
-// 已配置的推送目标：有 TG_BOT_TOKEN 且配了对应 chat id 才算
-function pushTargets(env) {
+// 从 Bot Token 的数字前缀解析 Bot 自身 id（my_chat_member 更新里靠它认出「被升/降级的是本 Bot」）
+function botIdFromToken(env) {
+const m = String(env.TG_BOT_TOKEN || "").match(/^(\d+):/);
+return m? Number(m[1]): null;
+}
+// 自动注册的频道表 intel:tgchannels：{ "<chatId>": {title, username, type:"channel", status:"active"|"removed", addedTs, updatedTs} }
+async function loadTgChannels(env) {
+return (await loadJSON(env, CONFIG.kvTgChannels, {})) || {};
+}
+// 登记/更新一个频道：status 为 "active"（成为/刷新推送目标）或 "removed"（被降级/移出，不再推送）；非频道 chat 一律忽略
+async function upsertTgChannel(env, chat, status) {
+if (!chat || chat.type !== "channel" || chat.id == null) return;
+const all = await loadTgChannels(env);
+const key = String(chat.id);
+const now = Date.now();
+const prev = all[key] || {};
+all[key] = {
+title: chat.title != null? String(chat.title): (prev.title || ""),
+username: chat.username? String(chat.username): null,
+type: "channel",
+status,
+addedTs: prev.addedTs || now,
+updatedTs: now,
+};
+await env.INTEL_KV.put(CONFIG.kvTgChannels, JSON.stringify(all));
+}
+// intel:briefpush 旧格式迁移：v5.2 及更早存 {date, dm:{ok,ts}, channel:{ok,ts}}，v5.3 起统一为 {date, targets:{"dm"|"ch:<chatId>": {ok,ts}}}。
+// 读取时转换：dm → targets.dm；channel → targets["ch:"+TG_CHANNEL_ID]（未配 TG_CHANNEL_ID 时挂到 legacy 键，不再门禁任何现行目标）。下一次推送写回时即落盘为新格式。
+function migrateBriefPushState(env, raw) {
+if (!raw || typeof raw !== "object") return { date: null, targets: {}};
+if (raw.targets && typeof raw.targets === "object") return { date: raw.date || null, targets: raw.targets};
+const targets = {};
+if (raw.dm && typeof raw.dm === "object") targets.dm = raw.dm;
+if (raw.channel && typeof raw.channel === "object") {
+targets[env.TG_CHANNEL_ID? "ch:" + String(env.TG_CHANNEL_ID): "legacy:channel"] = raw.channel;
+}
+return { date: raw.date || null, targets};
+}
+// 解析全部推送目标：私聊（TG_CHAT_ID）+ 手动频道（TG_CHANNEL_ID，可选覆盖）+ 全部 status=active 的自动注册频道；按 chatId 去重
+async function resolvePushTargets(env) {
 const targets = [];
-if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) targets.push({ key: "dm", chatId: String(env.TG_CHAT_ID)});
-if (env.TG_BOT_TOKEN && env.TG_CHANNEL_ID) targets.push({ key: "channel", chatId: String(env.TG_CHANNEL_ID)});
+if (!env.TG_BOT_TOKEN) return targets;
+const seen = new Set();
+const add = (t) => { if (!seen.has(t.chatId)) { seen.add(t.chatId); targets.push(t); } };
+if (env.TG_CHAT_ID) add({ key: "dm", kind: "dm", chatId: String(env.TG_CHAT_ID)});
+if (env.TG_CHANNEL_ID) add({ key: "ch:" + String(env.TG_CHANNEL_ID), kind: "channel", manual: true, chatId: String(env.TG_CHANNEL_ID)});
+const chans = await loadTgChannels(env);
+for (const [id, rec] of Object.entries(chans)) {
+if (rec && rec.status === "active") add({ key: "ch:" + id, kind: "channel", chatId: id, title: rec.title || ""});
+}
 return targets;
 }
 function tgEsc(s) {
@@ -1111,33 +1159,33 @@ const j = await r.json().catch(() => null);
 return !!(j && j.ok === true);
 } catch { return false; }
 }
-// 把简报发给给定目标列表，并把每个目标的结果（ok/时间）合并写回 intel:briefpush（跨天自动重置）
+// 把简报发给给定目标列表，并把每个目标的结果（ok/时间）合并写回 intel:briefpush 的 targets 映射（跨天自动重置，旧格式先迁移）
 async function pushBriefToTargets(env, brief, targets) {
 const text = buildBriefText(brief);
 const now = Date.now();
 const today = cstDateStr(now);
-let state = (await loadJSON(env, CONFIG.kvBriefPush, {})) || {};
-if (state.date !== today) state = { date: today};
+let state = migrateBriefPushState(env, (await loadJSON(env, CONFIG.kvBriefPush, {})) || {});
+if (state.date !== today) state = { date: today, targets: {}};
 const results = {};
 for (const t of targets) {
 const ok = await sendTelegramTo(env, t.chatId, text);
 results[t.key] = ok;
-state[t.key] = { ok, ts: now};
+state.targets[t.key] = { ok, ts: now};
 }
 await env.INTEL_KV.put(CONFIG.kvBriefPush, JSON.stringify(state));
 return results;
 }
 // 每日自动推送门禁：CST 08:00 之后、且当天该目标还没推送成功过，才补发（失败目标当天后续巡检会重试）
 async function maybePushDailyBrief(env) {
-const targets = pushTargets(env);
+const targets = await resolvePushTargets(env);
 if (!targets.length) return { pushed: false, reason: "not_configured"};
 const now = Date.now();
 const p = cstParts(now);
 if (p.hh * 60 + p.mm < 8 * 60) return { pushed: false, reason: "before_0800"};
 const today = cstDateStr(now);
-const state = (await loadJSON(env, CONFIG.kvBriefPush, {})) || {};
-const dayState = state.date === today? state: {};
-const due = targets.filter((t) => !(dayState[t.key] && dayState[t.key].ok));
+const state = migrateBriefPushState(env, (await loadJSON(env, CONFIG.kvBriefPush, {})) || {});
+const dayTargets = state.date === today? state.targets: {};
+const due = targets.filter((t) => !(dayTargets[t.key] && dayTargets[t.key].ok));
 if (!due.length) return { pushed: false, reason: "already_today"};
 const brief = await loadBrief(env);
 const results = await pushBriefToTargets(env, brief, due);
@@ -1147,7 +1195,8 @@ return { pushed: Object.values(results).some(Boolean), results};
 // ============================================================
 // 【核心模块】Telegram 命令系统 — 简报 Bot 的只读命令：POST /tg/webhook 接收 Telegram 更新，
 // 先校验请求头 x-telegram-bot-api-secret-token 与 Secret TG_WEBHOOK_SECRET 一致（未配置该 Secret 时接口直接 404，错密钥 403）；
-// 只处理 message 里的 /命令，其余更新一律 200 忽略。回复数据与面板同源（同一批 KV），全部只读，不做任何管理动作。
+// message 里的 /命令走只读回复，其余更新一律 200 忽略。回复数据与面板同源（同一批 KV），全部只读，不做任何管理动作。
+// v5.3 起同一 Webhook 还处理 my_chat_member / channel_post：Bot 被设为频道管理员（或在已注册频道发帖）时自动登记频道为简报推送目标。
 // 命令清单见 TG_COMMANDS，同时通过 GET /api/tg/commands 暴露，供部署时 setMyCommands 直接取用。
 // ============================================================
 const TG_COMMANDS = [
@@ -1185,8 +1234,8 @@ const lines = [
 ];
 return lines.join("\n");
 }
-// 按命令生成回复文本（HTML 解析模式）；无数据时统一回 TG_NO_DATA 或说明性文字，不抛错
-async function tgCommandReply(env, cmd) {
+// 按命令生成回复文本（HTML 解析模式）；chatId 为发令者所在 chat，/stats 用它判定是否为机主（只有机主能看到自动注册频道的标题）。无数据时统一回 TG_NO_DATA 或说明性文字，不抛错
+async function tgCommandReply(env, cmd, chatId) {
 switch (cmd) {
 case "start":
 case "help":
@@ -1252,32 +1301,60 @@ return lines.join("\n");
 case "stats": {
 const { repos, meta } = await loadIntelData(env);
 if (!meta) return "📊 <b>巡检状态</b>\n尚无巡检记录，等待首轮巡检。";
-const bp = (await loadJSON(env, CONFIG.kvBriefPush, {})) || {};
+const bp = migrateBriefPushState(env, (await loadJSON(env, CONFIG.kvBriefPush, {})) || {});
 const errCh = Object.keys(meta.errors || {});
+const allTargets = await resolvePushTargets(env);
+const autoChans = allTargets.filter((t) => t.kind === "channel" && !t.manual);
+const isOwner = !!(env.TG_CHAT_ID && chatId != null && String(chatId) === String(env.TG_CHAT_ID));
+let pushLine = `简报推送：私聊 ${env.TG_BOT_TOKEN && env.TG_CHAT_ID? "已配置": "未配置"} · 手动频道 ${env.TG_BOT_TOKEN && env.TG_CHANNEL_ID? "已配置": "未配置"} · 自动注册频道 ${autoChans.length} 个`;
+// 频道标题只给机主看（发令 chat 即 TG_CHAT_ID 私聊时），其他人只看数量，避免频道信息外泄
+if (isOwner && autoChans.length) pushLine += `（${autoChans.map((t) => tgEsc(t.title || t.chatId)).join("、")}）`;
+pushLine += ` · 最近推送日期 ${bp.date || "无"}`;
 return [
 "📊 <b>巡检状态</b>",
 `上次巡检：${fmtCST(meta.ts)}`,
 `通道：${meta.channelsOk?? "-"}/${meta.channelsTotal?? "-"} 正常${errCh.length? "（异常：" + errCh.join("、") + "）": ""}`,
 `监控仓库：${meta.total?? repos.length} 个 · 本轮新增 ${meta.newCount || 0} 个`,
 `种子保鲜：本轮单独保鲜 ${meta.seedRefreshed || 0} 个`,
-`简报推送：私聊 ${env.TG_BOT_TOKEN && env.TG_CHAT_ID? "已配置": "未配置"} · 频道 ${env.TG_BOT_TOKEN && env.TG_CHANNEL_ID? "已配置": "未配置"} · 最近推送日期 ${bp.date || "无"}`,
+pushLine,
 ].join("\n");
 }
 default:
 return tgHelpText();
 }
 }
-// Webhook 入口：校验密钥 → 只认 message 里的命令 → 回复发回消息所在的 chat（私聊即用户、群里即群）；回复发送失败不影响给 Telegram 回 200
+// 频道自动注册：my_chat_member 里被升/降级的若是本 Bot 且 chat 是频道——升为 administrator/creator 登记为 active 推送目标；
+// 其余状态（left/kicked/member 等，频道里被降为普通成员等于出局）对已登记频道标记 removed。涉及其他成员或其他类型 chat 的更新一律忽略。
+async function handleMyChatMember(env, mcm) {
+if (!mcm || !mcm.chat || mcm.chat.type !== "channel") return;
+const botId = botIdFromToken(env);
+const nm = mcm.new_chat_member;
+if (!nm || !nm.user || botId == null || Number(nm.user.id) !== botId) return;
+if (nm.status === "administrator" || nm.status === "creator") {
+await upsertTgChannel(env, mcm.chat, "active");
+} else {
+const all = await loadTgChannels(env);
+if (all[String(mcm.chat.id)]) await upsertTgChannel(env, mcm.chat, "removed");
+}
+}
+// Webhook 入口：校验密钥 → my_chat_member/channel_post 走频道自动注册（只登记、不回复）→ message 里的命令走只读回复（发回消息所在的 chat）；回复发送失败不影响给 Telegram 回 200
 async function handleTgWebhook(request, env) {
 if (!env.TG_WEBHOOK_SECRET) return new Response("not found", { status: 404});
 if (request.headers.get("x-telegram-bot-api-secret-token") !== env.TG_WEBHOOK_SECRET) return new Response("forbidden", { status: 403});
 let update = null;
 try { update = await request.json(); } catch { return new Response("ok"); }
-const msg = update && update.message;
+if (!update) return new Response("ok");
+if (update.my_chat_member) { await handleMyChatMember(env, update.my_chat_member); return new Response("ok"); }
+if (update.channel_post) {
+// v5.3 之前就已是管理员的频道不会再有 my_chat_member 事件，靠它在频道里的第一帖补登记（同时刷新标题/用户名）
+if (update.channel_post.chat) await upsertTgChannel(env, update.channel_post.chat, "active");
+return new Response("ok");
+}
+const msg = update.message;
 const text = msg && typeof msg.text === "string"? msg.text.trim(): "";
 if (!msg || !text.startsWith("/") || !msg.chat || msg.chat.id == null) return new Response("ok");
 const cmd = text.split(/\s+/)[0].slice(1).split("@")[0].toLowerCase();
-const reply = await tgCommandReply(env, cmd);
+const reply = await tgCommandReply(env, cmd, msg.chat.id);
 if (reply && env.TG_BOT_TOKEN) await sendTelegramTo(env, msg.chat.id, reply);
 return new Response("ok");
 }
@@ -1300,20 +1377,24 @@ return Response.json({ ok: true, ts: latest.ts || 0, count: repos.length, repos,
 }
 if (url.pathname === "/api/brief" && request.method === "GET") {
 const brief = await loadBrief(env);
-const bp = (await loadJSON(env, CONFIG.kvBriefPush, {})) || {};
-const dayState = bp.date === cstDateStr(Date.now())? bp: {};
+const bpRaw = (await loadJSON(env, CONFIG.kvBriefPush, {})) || {};
+const bp = migrateBriefPushState(env, bpRaw);
+const allTargets = await resolvePushTargets(env);
 brief.push = {
-configured: { dm: !!(env.TG_BOT_TOKEN && env.TG_CHAT_ID), channel: !!(env.TG_BOT_TOKEN && env.TG_CHANNEL_ID)},
-anyConfigured: pushTargets(env).length > 0,
+configured: {
+dm: !!(env.TG_BOT_TOKEN && env.TG_CHAT_ID),
+manualChannel: !!(env.TG_BOT_TOKEN && env.TG_CHANNEL_ID),
+autoChannels: allTargets.filter((t) => t.kind === "channel" && !t.manual).length,
+},
+anyConfigured: allTargets.length > 0,
 lastPushDate: bp.date || null,
-dm: dayState.dm || null,
-channel: dayState.channel || null,
+targets: bp.date === cstDateStr(Date.now())? bp.targets: {},
 };
 return Response.json({ ok: true, brief});
 }
 if (url.pathname === "/api/brief/push" && request.method === "POST") {
-// 手动推送总统简报：发给全部已配置目标（私聊 + 频道），与每日自动推送共用 intel:briefpush 状态；自身有 6 小时节流（intel:pushmanual）
-const targets = pushTargets(env);
+// 手动推送总统简报：发给全部推送目标（私聊 + 手动频道 + 自动注册频道），与每日自动推送共用 intel:briefpush 状态；自身有 6 小时节流（intel:pushmanual）
+const targets = await resolvePushTargets(env);
 if (!targets.length) return Response.json({ ok: false, pushed: false, status: "not_configured"});
 const st = (await loadJSON(env, CONFIG.kvPushManual, {})) || {};
 const now = Date.now();
