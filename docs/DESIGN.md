@@ -93,3 +93,5 @@ Telegram ───────┼──► POST /tg/webhook ──► 命令 (�
 Cron 6 小时一轮；每轮 11 次 Search + ≤3 次 Repos + 少量 KV 读写，远低于 Workers 免费版 50 子请求上限与 KV 免费额度；面板服务端渲染、零前端框架、零外部资源请求。
 
 只读 GET 路由（面板、`/api/repos`、`/api/stats`、`/api/brief`、`/api/tg/commands`）另有边缘缓存兜底（v5.4）：Cache API 读穿、TTL 30 分钟，命中时零 Worker 渲染、零 KV 读取（响应头 `x-intel-cache` 标 HIT/MISS）；数据只在巡检时变化，巡检结束即主动删键失效。空数据状态与 POST 路由永不入缓存，Cache API 不可用时自动降级直读 KV。
+
+**多语言层（v5.5）**：面板与 `/api/brief` 的本地化是纯 UI 层——`STRINGS`/`TAG_I18N`/`CHANNEL_I18N` 词典加 `t()` 渲染时翻译，存储记录（标签原文、中文研判成品句、种子笔记）一字不动；研判另存结构化 `verdictParts` 供非中文拼句，旧记录走本地化通用兜底。语言解析 `?lang=` > Cookie > `Accept-Language` > zh；Telegram 推送与命令固定中文。缓存键对语言相关的两个路由（`/`、`/api/brief`）带 `?lang=` 后缀、八语各一份，巡检失效时全部变体一并删除，中性路由键不变；`Set-Cookie` 只写返回响应、永不进入缓存副本。
