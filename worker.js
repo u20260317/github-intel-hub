@@ -1,5 +1,5 @@
 // ============================================================
-// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v2：9 通道 + 重点监控种子 WATCHLIST）
+// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v3：11 通道 + 安全细粒度标签体系 + 全部情报分页）
 // 单文件 Cloudflare Worker：定时巡检 GitHub 热门仓库，做规则研判（热度/学习点/评级），
 // 以「黑客情报中心」风格暗色面板呈现。零依赖，数据存 KV（绑定名 INTEL_KV）。
 // 研判为规则引擎产出，非 AI 生成，面板与代码均如实标注「规则研判」。
@@ -23,7 +23,8 @@ const d = new Date(Date.now() - n * 86400000);
 return d.toISOString().slice(0, 10);
 }
 
-// 九个情报通道：每通道 1 次 Search API 调用，一轮巡检共 9 次请求，远低于免费版 50 子请求上限（省流）
+// 十一个情报通道：每通道 1 次 Search API 调用，一轮巡检共 11 次请求，远低于免费版 50 子请求上限（省流）
+// 查询语法教训：OR 括号组里只能放无引号 token；带引号短语（如 "claude skills"）放进 OR 括号会让 GitHub 返回 total_count=0（实测验证）。
 function buildChannels() {
 const d7 = daysAgo(7), d30 = daysAgo(30), d90 = daysAgo(90);
 return [
@@ -34,8 +35,10 @@ return [
 { key: "media", name: "多媒体生成", q: `(comfyui OR image-generation OR text-to-speech) stars:>100 pushed:>${d30}`, sort: "stars", perPage: 10},
 { key: "devtools", name: "开发工具", q: `(developer-tools OR browser-automation OR playwright) stars:>500 pushed:>${d30}`, sort: "stars", perPage: 10},
 { key: "security", name: "网安 · 红队 · SRC", q: `(cybersecurity OR "red team" OR "bug bounty" OR penetration-testing OR vulnerability) stars:>200 pushed:>${d90}`, sort: "stars", perPage: 10},
-{ key: "skills", name: "Skill 生态", q: `("claude skills" OR "agent skills" OR claude-skill OR agent-skills) stars:>100`, sort: "stars", perPage: 10},
+{ key: "skills", name: "Skill 生态", q: `(claude-skills OR agent-skills OR claude-skill) stars:>50 pushed:>${d90}`, sort: "stars", perPage: 10},
 { key: "creator", name: "自媒体全套", q: `(short-video OR video-editing OR ffmpeg OR "content creation" OR subtitles OR livestream) stars:>200 pushed:>${d30}`, sort: "stars", perPage: 10},
+{ key: "src-hunt", name: "SRC · 挖洞", q: `(bug-bounty OR 漏洞挖掘 OR vulnerability-scanner OR vulnerability-hunting) stars:>30 pushed:>${d90}`, sort: "stars", perPage: 10},
+{ key: "sec-learning", name: "网安学习资料", q: `(pentest OR ctf OR web-security OR cybersecurity-learning OR security-roadmap) stars:>200 pushed:>${d90}`, sort: "stars", perPage: 10},
 ];
 }
 
@@ -257,12 +260,51 @@ const LEARNING_MAP = [
 ["webgpu", "端侧推理"],
 ];
 
+// 安全细粒度标签：对仓库名+描述+topics 做关键词匹配（学习/研究向标签，非利用指南）
+// word=true 的短词（rce/poc）用单词边界匹配，避免 "source" 误命中 RCE、"epoch" 误命中 PoC
+const SECURITY_TAG_MAP = [
+["sql-injection", "SQL 注入", false],
+["sqli", "SQL 注入", false],
+["xss", "XSS", false],
+["ssrf", "SSRF", false],
+["rce", "RCE", true],
+["ctf", "CTF 竞赛", false],
+["osint", "开源情报 OSINT", false],
+["malware", "恶意代码分析", false],
+["forensics", "数字取证", false],
+["blue-team", "蓝队防御", false],
+["code-audit", "代码审计", false],
+["audit", "代码审计", false],
+["intranet", "内网渗透", false],
+["privilege-escalation", "权限提升", false],
+["scanner", "漏洞扫描", false],
+["poc", "PoC 研究", true],
+["writeup", "漏洞复盘", false],
+["roadmap", "学习路线", false],
+["learning", "学习路线", false],
+["phishing", "钓鱼防御演练", false],
+["reverse", "逆向工程", false],
+["fuzz", "模糊测试", false],
+["devsecops", "DevSecOps", false],
+];
+
 function analyze(rec) {
 const hay = [rec.full_name, rec.description, rec.language,...(rec.topics || [])].join(" ").toLowerCase();
 const tags = [];
 for (const [kw, point] of LEARNING_MAP) {
 if (hay.includes(kw) &&!tags.includes(point)) tags.push(point);
 if (tags.length >= 4) break;
+}
+// 安全标签合并进 learnTags：去重，总数上限 6
+const secHay = [rec.full_name, rec.description,...(rec.topics || [])].join(" ").toLowerCase();
+const secChannel = (rec.channels || []).some((c) => ["security", "src-hunt", "sec-learning"].includes(c));
+for (const [kw, point, word] of SECURITY_TAG_MAP) {
+if (tags.length >= 6) break;
+if (tags.includes(point)) continue;
+// "learning" 单独出现多半是 machine learning：仅当仓库在安全通道或文本带安全语境时才标「学习路线」
+if (kw === "learning" &&!secChannel &&!secHay.includes("security") &&!secHay.includes("pentest") &&!secHay.includes("hacking")) continue;
+const hit = word? new RegExp(`\\b${kw}\\b`).test(secHay): secHay.includes(kw);
+if (hit) tags.push(point);
 }
 if (!tags.length && rec.language) tags.push(rec.language + " 工程实践");
 
@@ -310,10 +352,10 @@ catch { return iso;}
 function repoCard(r, rank) {
 const delta = typeof r.starDelta === "number"
 ? `<span class="delta ${r.starDelta >= 0? "up": "down"}">${r.starDelta >= 0? "+": ""}${r.starDelta}★ 本轮</span>`: "";
-const tags = (r.learnTags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("");
+const tags = (r.learnTags || []).map((t) => `<button type="button" class="tag tagchip" data-tag="${esc(t)}" title="按此标签筛选全部情报">${esc(t)}</button>`).join("");
 const chans = (r.channels || []).join(" ");
 const rankHtml = rank? `<span class="rank">#${rank}</span>`: "";
-return `<article class="card" data-channels="${esc(chans)}" data-grade="${esc(r.grade || "B")}" data-name="${esc((r.full_name + " " + (r.description || "")).toLowerCase())}">
+return `<article class="card" data-channels="${esc(chans)}" data-grade="${esc(r.grade || "B")}" data-tags="${esc((r.learnTags || []).join("|"))}" data-name="${esc((r.full_name + " " + (r.description || "")).toLowerCase())}">
 <div class="chead"><span>${rankHtml}<a class="rname" href="${esc(r.html_url)}" target="_blank" rel="noopener">${esc(r.full_name)}</a></span><span class="grade g${esc(r.grade || "B")}">${esc(r.grade || "B")}级</span></div>
 <p class="desc">${esc(r.description || "（无描述）")}</p>
 <div class="meta">★ ${r.stars} · ⑂ ${r.forks}${r.language? " · " + esc(r.language): ""}${r.license? " · " + esc(r.license): ""} ${delta}</div>
@@ -340,6 +382,25 @@ const aiList = repos.filter((r) => r.channels.includes("ai-agent")).slice(0, 10)
 const secList = repos.filter((r) => r.channels.includes("security")).slice(0, 10);
 const skillList = repos.filter((r) => r.channels.includes("skills")).slice(0, 10);
 const creatorList = repos.filter((r) => r.channels.includes("creator")).slice(0, 10);
+const srcList = repos.filter((r) => r.channels.includes("src-hunt")).slice(0, 10);
+const secLearnList = repos.filter((r) => r.channels.includes("sec-learning")).slice(0, 10);
+// 热门标签云：统计安全三通道（security/src-hunt/sec-learning）仓库的标签频次，取前 15
+const tagFreq = {};
+for (const r of repos) {
+if (!(r.channels || []).some((c) => ["security", "src-hunt", "sec-learning"].includes(c))) continue;
+for (const t of r.learnTags || []) tagFreq[t] = (tagFreq[t] || 0) + 1;
+}
+const tagCloud = Object.entries(tagFreq).sort((a, b) => b[1] - a[1]).slice(0, 15)
+.map(([t, n]) => `<button type="button" class="tag tagchip cloudchip" data-tag="${esc(t)}" title="按此标签筛选全部情报">${esc(t)} · ${n}</button>`).join("");
+// 全部情报分页：每页 24 条（与 DEAL HUB 约定一致），服务端先渲染初始页码按钮，筛选后由前端重算
+const PAGE_SIZE_SSR = 24;
+const totalPages = Math.max(1, Math.ceil(repos.length / PAGE_SIZE_SSR));
+const pagerBtns = (() => {
+const pages = [];
+if (totalPages <= 7) { for (let i = 1; i <= totalPages; i++) pages.push(i); }
+else pages.push(1, 2, "…", totalPages - 1, totalPages);
+return pages.map((p) => p === "…"? `<span class="pgdots">…</span>`: `<button class="fbtn pgnum${p === 1? " on": ""}" data-page="${p}">${p}</button>`).join("");
+})();
 const watchlist = buildWatchlist(repos);
 const topHeat = repos.length? Math.max(...repos.map((r) => r.heat || 0)): 0;
 const newCount = meta? meta.newCount || 0: 0;
@@ -404,6 +465,14 @@ h2{color:#67e8f9;letter-spacing:2px;font-size:18px;text-shadow:0 0 10px rgba(103
 .heatfill{height:100%;background:linear-gradient(90deg,#22c55e,#67e8f9);box-shadow:0 0 8px rgba(103,232,249,.7);animation:fillin 1.1s ease-out}
 @keyframes fillin{from{width:0}}
 .tags{margin:8px 0}.tag{display:inline-block;border:1px solid #0e7490;color:#67e8f9;border-radius:999px;padding:1px 9px;font-size:12px;margin:0 5px 5px 0}
+button.tag{font-family:inherit;background:transparent}
+.tagchip{cursor:pointer;transition:background .2s,box-shadow .2s}.tagchip:hover{background:#164e63;box-shadow:0 0 9px rgba(103,232,249,.45)}
+.cloudchip{font-size:13px;padding:3px 12px}
+.tagcloud{margin:0 0 14px;line-height:2}
+.tagpill{display:inline-block;border:1px dashed #facc15;color:#fef08a;border-radius:6px;padding:4px 10px;font-size:13px;margin-left:8px}
+.pager{margin:18px 0 6px;display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+.pgdots{color:#5f7a68;padding:0 4px}
+.fbtn:disabled{opacity:.35;cursor:default}
 .verdict{color:#fef08a;font-size:13px;line-height:1.55;border-left:3px solid #facc15;padding-left:9px}
 .btn,.fbtn{background:#052e16;color:#4ade80;border:1px solid #22c55e;border-radius:6px;padding:8px 14px;cursor:pointer;font-family:inherit;font-size:13px;margin:0 6px 8px 0}
 .btn:hover,.fbtn:hover{background:#14532d}.fbtn.on{background:#22c55e;color:#04120a;font-weight:700}
@@ -436,16 +505,21 @@ ${empty}
 <h2>◢ 飙升榜 STAR SURGE</h2><div class="grid">${surgeList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
 <h2>◢ 热门新星 NEW STARS</h2><div class="grid">${newStars.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
 <h2>◢ AI / AGENT 专区</h2><div class="grid">${aiList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
-<h2>◢ 网安 · 红队 · SRC 情报 SECURITY INTEL</h2><div class="grid">${secList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
+<h2>◢ 网安 · 红队 · SRC 情报 SECURITY INTEL</h2>
+<h3 class="seedcat">▸ 热门标签 TAG CLOUD（点标签筛选全部情报）</h3><div class="tagcloud" id="tag-cloud">${tagCloud || '<span class="muted">暂无标签数据</span>'}</div>
+<div class="grid">${secList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
+<h2>◢ SRC · 挖洞 SRC HUNTING</h2><div class="grid">${srcList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
+<h2>◢ 网安学习资料 SECURITY LEARNING</h2><div class="grid">${secLearnList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
 <h2>◢ Skill 生态 SKILL ECOSYSTEM</h2><div class="grid">${skillList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
 <h2>◢ 自媒体全套 CREATOR TOOLKIT</h2><div class="grid">${creatorList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
 <h2>◢ 重点监控 WATCHLIST</h2>
 <p class="muted">人工精选种子清单（已预筛）：Skill 生态 / 写作 / 科研 / 自媒体 / 网安五类。种子若被本轮巡检命中，卡片会带其实时 ★、热度与本轮增量；未命中则标注「点名监控中」。种子学习点为人工研判，与规则研判区分。</p>
 ${seedGroups}
-<h2>◢ 全部情报 ALL INTEL</h2>
+<h2 id="all-intel">◢ 全部情报 ALL INTEL</h2>
 <div class="filterbar"><div>${filterBtns}</div>
-<div><button class="fbtn on" data-gf="all">评级 全部</button><button class="fbtn" data-gf="S">S 级</button><button class="fbtn" data-gf="A">A 级</button><button class="fbtn" data-gf="B">B 级</button><input type="search" id="q" placeholder="🔍 搜仓库名 / 描述 / 语言"><span class="muted" id="shown"></span></div></div>
+<div><button class="fbtn on" data-gf="all">评级 全部</button><button class="fbtn" data-gf="S">S 级</button><button class="fbtn" data-gf="A">A 级</button><button class="fbtn" data-gf="B">B 级</button><input type="search" id="q" placeholder="🔍 搜仓库名 / 描述 / 语言"><span class="muted" id="shown"></span><span id="tag-pill" class="tagpill" style="display:none">标签：<b id="tag-name"></b> <button class="fbtn" id="tag-clear" type="button">✕ 清除标签</button></span></div></div>
 <div class="grid" id="all-grid">${repos.map((r, i) => repoCard(r, i + 1)).join("")}</div>
+<div class="pager" id="pager"><button class="fbtn" id="pg-prev" type="button">← 上一页</button><span id="pg-nums">${pagerBtns}</span><button class="fbtn" id="pg-next" type="button">下一页 →</button><span class="muted" id="pg-status"></span></div>
 <p class="muted">数据源：GitHub Search API（公开接口，未认证时限额约 10 次/分钟、每小时搜索配额有限；配置 GITHUB_TOKEN 可提高）。星标增量需至少两轮巡检对比快照得出，第一轮均为「新入情报库」。本站研判均为规则引擎产出，重点监控种子的学习点为人工撰写，均不构成推荐结论。</p>
 </div>
 <script>
@@ -459,28 +533,68 @@ location.reload();
 }
 function tickClock(){ var el=document.getElementById("clock"); if(el) el.textContent=new Date().toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false}); }
 tickClock(); setInterval(tickClock, 1000);
-var curFilter="all", curGrade="all";
-function applyFilter(){
+var curFilter="all", curGrade="all", curTag="", curPage=1;
+var PAGE_SIZE = 24;
+function cardMatches(c){
 var q=(document.getElementById("q").value||"").toLowerCase().trim();
-var shown=0;
-document.querySelectorAll("#all-grid .card").forEach(function(c){
-var ok=(curFilter==="all"||(" "+c.dataset.channels+" ").indexOf(" "+curFilter+" ")>=0) && (curGrade==="all"||c.dataset.grade===curGrade) && (!q||c.dataset.name.indexOf(q)>=0);
-c.style.display=ok?"":"none"; if(ok) shown++;
-});
-document.getElementById("shown").textContent=" 当前显示 "+shown+" 个";
+var okChan=curFilter==="all"||(" "+c.dataset.channels+" ").indexOf(" "+curFilter+" ")>=0;
+var okGrade=curGrade==="all"||c.dataset.grade===curGrade;
+var okQ=!q||c.dataset.name.indexOf(q)>=0;
+var okTag=!curTag||("|"+(c.dataset.tags||"")+"|").indexOf("|"+curTag+"|")>=0;
+return okChan&&okGrade&&okQ&&okTag;
+}
+function pageList(cur,total){
+if(total<=7){ var a=[]; for(var i=1;i<=total;i++) a.push(i); return a;}
+var s={}; [1,2,total-1,total,cur-1,cur,cur+1].forEach(function(p){ if(p>=1&&p<=total) s[p]=1;});
+var arr=Object.keys(s).map(Number).sort(function(a,b){return a-b;});
+var out=[],prev=0;
+arr.forEach(function(p){ if(prev&&p-prev>1) out.push("…"); out.push(p); prev=p;});
+return out;
+}
+function scrollAll(){ var el=document.getElementById("all-intel"); if(el) el.scrollIntoView({behavior:"smooth"});}
+function renderPager(total,pages){
+var nums=document.getElementById("pg-nums");
+nums.innerHTML=pageList(curPage,pages).map(function(p){
+return p==="…"? '<span class="pgdots">…</span>': '<button class="fbtn pgnum'+(p===curPage?" on":"")+'" data-page="'+p+'">'+p+'</button>';
+}).join("");
+document.getElementById("pg-status").textContent="第 "+curPage+" / "+pages+" 页 · 共 "+total+" 条（筛选后）";
+document.getElementById("pg-prev").disabled=curPage<=1;
+document.getElementById("pg-next").disabled=curPage>=pages;
+nums.querySelectorAll("[data-page]").forEach(function(b){ b.addEventListener("click", function(){
+curPage=parseInt(b.dataset.page,10); applyFilter(false); scrollAll();
+});});
+}
+function applyFilter(reset){
+if(reset) curPage=1;
+var all=Array.prototype.slice.call(document.querySelectorAll("#all-grid .card"));
+var list=all.filter(cardMatches);
+var pages=Math.max(1, Math.ceil(list.length/PAGE_SIZE));
+if(curPage>pages) curPage=pages;
+all.forEach(function(c){ c.style.display="none";});
+list.slice((curPage-1)*PAGE_SIZE, curPage*PAGE_SIZE).forEach(function(c){ c.style.display="";});
+document.getElementById("shown").textContent=" 当前显示 "+list.length+" 个";
+var pill=document.getElementById("tag-pill");
+if(curTag){ pill.style.display=""; document.getElementById("tag-name").textContent=curTag;} else { pill.style.display="none";}
+renderPager(list.length, pages);
 }
 document.querySelectorAll("[data-filter]").forEach(function(b){ b.addEventListener("click", function(){
 curFilter=b.dataset.filter;
 document.querySelectorAll("[data-filter]").forEach(function(x){ x.classList.remove("on");});
-b.classList.add("on"); applyFilter();
+b.classList.add("on"); applyFilter(true);
 });});
 document.querySelectorAll("[data-gf]").forEach(function(b){ b.addEventListener("click", function(){
 curGrade=b.dataset.gf;
 document.querySelectorAll("[data-gf]").forEach(function(x){ x.classList.remove("on");});
-b.classList.add("on"); applyFilter();
+b.classList.add("on"); applyFilter(true);
 });});
-document.getElementById("q").addEventListener("input", applyFilter);
-applyFilter();
+document.getElementById("q").addEventListener("input", function(){ applyFilter(true);});
+document.querySelectorAll("[data-tag]").forEach(function(ch){ ch.addEventListener("click", function(){
+curTag=ch.dataset.tag; applyFilter(true); scrollAll();
+});});
+document.getElementById("tag-clear").addEventListener("click", function(){ curTag=""; applyFilter(true);});
+document.getElementById("pg-prev").addEventListener("click", function(){ if(curPage>1){ curPage--; applyFilter(false); scrollAll();}});
+document.getElementById("pg-next").addEventListener("click", function(){ curPage++; applyFilter(false); scrollAll();});
+applyFilter(false);
 </script>
 </body></html>`;
 return new Response(html, { headers: { "content-type": "text/html;charset=utf-8"}});
