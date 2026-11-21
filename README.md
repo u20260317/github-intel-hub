@@ -19,7 +19,7 @@
   10. `src-hunt` SRC·挖洞（v3 新增）：bug-bounty / 漏洞挖掘 / vulnerability-scanner / vulnerability-hunting，stars>30、近 90 天有推送
   11. `sec-learning` 网安学习资料（v3 新增）：pentest / ctf / web-security / cybersecurity-learning / security-roadmap，stars>200、近 90 天有推送
   - **查询语法教训（实测）**：GitHub Search 的 OR 括号组里只能放无引号 token；把带引号短语（如 `"claude skills"`）放进 OR 括号会直接返回 `total_count=0`（v2 的 skills 通道因此整轮为空）。引号短语只能放在括号外单独使用，如 `"bug bounty" tools stars:>100`（54 条，正常）。中文关键词可用，如 `漏洞挖掘 stars:>50`（47 条）。
-- **重点监控种子 WATCHLIST**：代码内 `SEEDS` 人工精选清单共 23 条（Skill 生态 12 仓 + 1 个外部站点 Cocoloop、写作 3、科研 1、自媒体 8、网安 2），每条带人工撰写的一句学习点。面板有独立「重点监控 WATCHLIST」分区按类别分组展示；种子若被巡检命中同名仓库，卡片会合并显示其实时 ★/热度/评级/本轮增量，未命中标注「点名监控中」。种子只做点名展示，不额外发请求抓取（省流）。
+- **重点监控种子 WATCHLIST**：代码内 `SEEDS` 人工精选清单共 23 条（Skill 生态 12 仓 + 1 个外部站点 Cocoloop、写作 3、科研 1、自媒体 8、网安 2），每条带人工撰写的一句学习点。面板有独立「重点监控 WATCHLIST」分区按类别分组展示；种子若被巡检命中同名仓库，卡片会合并显示其实时 ★/热度/评级/本轮增量；未命中的种子由巡检「单独保鲜」轮换抓取（见下方 v5 说明），再未轮到的标注「点名监控中」。
 - **快照对比**：每轮把星标数存快照（KV `intel:prev`），下一轮算出每个仓库的本轮增量 `starDelta`，面板上有 `+N★ 本轮` 徽章，飙升榜按增量排序。
 - **规则研判**（代码里是 `LEARNING_MAP` 关键词表 + 加权公式，面板如实标注「规则研判」）
   - 热度分 0-100：星标规模 40 + 本轮增量 30 + 推送新鲜度 20 + fork 活跃度 10
@@ -37,6 +37,14 @@
 - **双分页控件**：「全部情报」的分页控件在网格**上方和下方各有一套**（醒目的绿色边框样式），页码、上一页/下一页、状态行共享同一状态，点任意一套都会同步另一套；每页 24 条，与通道/评级/搜索/标签筛选照常联动（筛选变化回到第 1 页）。
 - **总统简报（悬浮窗）**：右下角常驻「📋 总统简报」悬浮按钮，点开是一个可拖动的简报窗（按住标题栏拖动，支持鼠标与触控，拖不出屏幕边界；右上角 — 最小化、✕ 关闭，Esc 也可关闭；小屏自动适配 92vw 宽）。内容由服务端按当前数据用规则模板生成：【今日态势】一句话综述 + 关键词热度一行、【飙升 TOP3】、【热度 TOP3】、【网安焦点】（含热门安全标签）、【Skill 焦点】、【改名动态】（有仓库改名时出现）、【重点监控动态】（种子命中数与领跑种子），每条都可点进 GitHub。页脚标注生成时间与「规则引擎（非 AI 生成）」。同一份简报数据也以 JSON 形式内嵌在页面里（`#brief-data`），并可通过 `GET /api/brief` 单独获取。
 
+## v5 新增
+
+- **种子保鲜轮换**：每轮巡检在 11 次搜索之外，最多再花 3 次核心 Repos API 调用，专门保鲜「未被本轮巡检命中」的种子。游标存 KV `intel:seedcursor`，按种子清单顺序轮换（跳过已命中的），几轮就能把全部未命中种子轮一遍。保鲜结果存 `intel:seedlive`：当前全名/★/fork/推送时间 + 保鲜时间戳；种子卡的数据新鲜度分三级——本轮巡检实时命中 → 单独保鲜（卡片带「单独保鲜」标记与时间）→ 静态点名。保鲜走 `GET /repos/{owner}/{repo}`，改名仓库会被重定向到新地址，响应即当前身份：面板显示当前名并标注「原 X 已改名」，同时把当前 id 回写 `intel:seedids`；返回 404 的种子标注「疑似删库/改名未追踪」。一轮巡检 GitHub 调用上限 = 11 搜索 + 3 保鲜 = 14 次。
+- **话题趋势历史**：每轮巡检把全部仓库的 topics 聚合（每话题：仓库数 + 累计星标，只留累计星标前 40）追加进 KV `intel:topichist`，只保留最近 56 个快照（6 小时一轮 ≈ 14 天）。趋势口径：与约 24 小时前最接近的历史快照比星标/仓库数增量，并计算「连续升温轮数」（从最新快照往回、累计星标连续严格递增的轮数）。24h 星标增量为正的前 5 个话题进总统简报的【话题趋势】，面板总览区标签云下方也有一行同样口径的话题趋势。历史不足两轮时自动隐藏。
+- **总统简报 Telegram 每日推送**：配置 Secret 后，Cron 巡检成功且北京时间已过 08:00 时，把总统简报（与 Web 版同结构：今日态势/飙升 TOP3/热度 TOP3/网安焦点/话题趋势/改名动态 + 面板链接，HTML 格式、约 1800 字内）推送到 Telegram。推送目标有两个，可同时配：`TG_CHAT_ID`（Bot 私聊）和 `TG_CHANNEL_ID`（频道，可填 `@频道名` 或 `-100…` 数字 id），外加共用的 `TG_BOT_TOKEN`；都没配则功能静默关闭。**注意：往频道推送时，Bot 必须是该频道的管理员，否则 Telegram 会拒绝发帖。** 每日一次门禁按目标分别判定，状态存 `intel:briefpush`（`{date, dm:{ok,ts}, channel:{ok,ts}}`）：某个目标失败可在当天后续巡检自动重试，已成功的目标当天不重发。手动触发：`POST /api/brief/push` 一次推全部已配置目标，自身有 6 小时节流（KV `intel:pushmanual`）；`GET /api/brief` 的 `brief.push` 字段会回报两个目标的配置状态与今日推送结果。
+- **通道失败重试**：任一通道搜索报错（如未认证限额 403）时，间隔 2 秒自动重试一次再判定失败，重试过的通道记入巡检元信息 `meta.retriedChannels`；种子保鲜数记入 `meta.seedRefreshed`。
+- **全局吸顶栈**：标题栏、热门标签行与筛选条（通道/评级/搜索/展开收起）已合并为一个吸顶栈（实心背景），从页面任何滚动位置都能直接筛选，不再只在「全部情报」区内可用；「全部情报」区内只保留上下两套分页控件。
+
 ## 监控锚点：仓库 id（v4）
 
 仓库会被改名或转移所有者，`full_name` 不是稳定锚点。v4 起每条记录都存 GitHub 数字仓库 `id`（Search API 原样返回），并以它为准对齐：
@@ -52,7 +60,8 @@
 3. 给 Worker 绑 KV：变量名必须为 **`INTEL_KV`**，指向第 1 步的 namespace。
 4. （可选）加 Cron 触发器，推荐 `17 */6 * * *`（每 6 小时巡检一次；未认证 GitHub 限额低，别太勤）。
 5. （可选）加 Secret `GITHUB_TOKEN`：填一个 GitHub Personal Access Token（只读公开数据即可）可大幅提高 API 限额；不填也能跑。
-6. 打开 Worker 地址，点「立即巡检」拉第一批数据；或 `curl -X POST https://<你的地址>/api/refresh`。
+6. （可选）总统简报 Telegram 推送：加 Secret `TG_BOT_TOKEN`（BotFather 给的 token），再加 `TG_CHAT_ID`（你的私聊 id）和/或 `TG_CHANNEL_ID`（频道 `@用户名` 或 `-100…` 数字 id）任意一个或两个。推频道时 Bot 必须是该频道管理员。都不加则不推送。
+7. 打开 Worker 地址，点「立即巡检」拉第一批数据；或 `curl -X POST https://<你的地址>/api/refresh`。
 
 ## 接口
 
@@ -62,11 +71,12 @@
 | `GET /api/repos` | 最新一批仓库 JSON（含 heat/grade/learnTags/verdict/starDelta），并附 `watchlist` 种子合并数据 |
 | `GET /api/watchlist` | 重点监控种子清单 JSON（含每条的分类、人工学习点与实时命中数据 `live`，未命中为 `null`） |
 | `GET /api/stats` | 最近一轮巡检元信息（时间、各通道条数、错误、改名事件 `renames`） |
-| `GET /api/brief` | 总统简报 JSON（与面板悬浮窗同一份数据：态势、飙升/热度 TOP3、网安/Skill 焦点、改名动态、关键词热度、重点监控动态） |
+| `GET /api/brief` | 总统简报 JSON（与面板悬浮窗同一份数据：态势、飙升/热度 TOP3、网安/Skill 焦点、改名动态、关键词热度、话题趋势、重点监控动态），并附 `brief.push` 推送状态（两个 TG 目标的配置与今日结果） |
+| `POST /api/brief/push` | 手动推送总统简报到全部已配置 TG 目标（私聊 + 频道），6 小时节流；未配置返回 `status: "not_configured"` |
 | `POST /api/refresh` | 手动触发巡检，30 分钟内重复调用会被节流（返回 `throttled: true`） |
 | Cron `scheduled()` | 定时巡检，不走手动节流 |
 
-KV 键：`intel:latest`（最新数据）、`intel:prev`（上轮星标快照，v4 起为 id 键格式）、`intel:meta`（巡检元信息）、`intel:seedids`（种子仓库 id 映射）。
+KV 键：`intel:latest`（最新数据）、`intel:prev`（上轮星标快照，v4 起为 id 键格式）、`intel:meta`（巡检元信息）、`intel:seedids`（种子仓库 id 映射）、`intel:seedcursor`（种子保鲜轮换游标）、`intel:seedlive`（种子保鲜结果）、`intel:topichist`（话题趋势历史快照，最近 56 个）、`intel:briefpush`（简报每日推送状态，按目标分别记录）、`intel:pushmanual`（手动推送节流时间戳）。
 
 ## 数据诚实说明
 
@@ -83,4 +93,4 @@ KV 键：`intel:latest`（最新数据）、`intel:prev`（上轮星标快照，
 node --check worker.js
 ```
 
-本地 harness（Mock KV + Mock GitHub API）不在本目录：v2 实测 27/27 通过；v3 harness 断言 11 通道恰好 11 次请求、skills 通道修复后有数据入库、src-hunt 仓库的 XSS/PoC 标签、sec-learning 的学习路线标签、安全标签合并进 `/api/repos`、面板新分区/标签云/可点标签 chip（data-tag）/分页控件（data-page、上一页/下一页）与每页 24 条常量。v4 harness（`/tmp/intel-harness4.mjs`）27/27 通过：记录存 id、快照 id 键格式、同 id 改名后增量精确（+150）且 `renamedFrom`/`meta.renames` 正确、旧扁平快照迁移轮仍算出增量（+40）、种子 id 映射落盘且改名后按 id 命中并显示新名、面板折叠开关（data-collapse ≥10）/展开全部按钮/双分页控件/简报悬浮窗标记与内嵌 JSON 可解析、`/api/brief` 含 renames 与 topTopics、拖拽处理代码（brief-head 的 pointerdown）存在。
+本地 harness（Mock KV + Mock GitHub API）不在本目录：v2 实测 27/27 通过；v3 harness 断言 11 通道恰好 11 次请求、skills 通道修复后有数据入库、src-hunt 仓库的 XSS/PoC 标签、sec-learning 的学习路线标签、安全标签合并进 `/api/repos`、面板新分区/标签云/可点标签 chip（data-tag）/分页控件（data-page、上一页/下一页）与每页 24 条常量。v4 harness（`/tmp/intel-harness4.mjs`）27/27 通过：记录存 id、快照 id 键格式、同 id 改名后增量精确（+150）且 `renamedFrom`/`meta.renames` 正确、旧扁平快照迁移轮仍算出增量（+40）、种子 id 映射落盘且改名后按 id 命中并显示新名、面板折叠开关（data-collapse ≥10）/展开全部按钮/双分页控件/简报悬浮窗标记与内嵌 JSON 可解析、`/api/brief` 含 renames 与 topTopics、拖拽处理代码（brief-head 的 pointerdown）存在。v5 harness（`/tmp/intel-harness5.mjs`）53/53 通过：种子保鲜轮换（两轮游标 0→4→7、每轮恰好 3 个未命中种子、改名种子存当前名并回写 seedids、404 标记 gone、buildWatchlist 用 seedlive 星标）、话题趋势（topichist 追加与 56 上限裁剪、mcp 的 dStars24h/dCount24h/streak 精确）、TG 双目标推送（双目标各 1 条且 chat_id 正确、只配频道只发频道、按目标每日门禁：频道失败次轮只重试频道、08:00 前不推、次日恢复、手动推送全目标 + 6h 节流 + 与每日状态共用、无配置静默与 not_configured）、通道 403 重试成功且记入 retriedChannels、全局吸顶栈结构（stickyhead 顺序包含 topbar/标签行/筛选条、筛选条不在 sec-all 内、全部控件 id 恰好出现 1 次）。
