@@ -1,5 +1,5 @@
 // ============================================================
-// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试；v5.2：Telegram Bot 命令系统；v5.3：频道自动注册——Bot 被设为频道管理员后经 my_chat_member/channel_post 自动登记为推送目标）
+// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试；v5.2：Telegram Bot 命令系统；v5.3：频道自动注册——Bot 被设为频道管理员后经 my_chat_member/channel_post 自动登记为推送目标；v5.3.1：手动推送接口加 PUSH_KEY 鉴权 + 节流改为按目标分别计算）
 // 单文件 Cloudflare Worker：定时巡检 GitHub 热门仓库，做规则研判（热度/学习点/评级），
 // 以「黑客情报中心」风格暗色面板呈现。零依赖，数据存 KV（绑定名 INTEL_KV）。
 // 研判为规则引擎产出，非 AI 生成，面板与代码均如实标注「规则研判」。
@@ -23,7 +23,7 @@ kvBriefPush: "intel:briefpush",
 kvPushManual: "intel:pushmanual",
 kvTgChannels: "intel:tgchannels",
 panelUrl: "https://github-intel-hub.u20261103.workers.dev", // 总统简报推送里的面板链接（换部署地址时改这里）
-pushThrottleMs: 6 * 3600 * 1000, // 手动推送 /api/brief/push 的节流：6 小时最多 1 次
+pushThrottleMs: 6 * 3600 * 1000, // 手动推送 /api/brief/push 的节流：每个推送目标 6 小时最多手动推 1 次（v5.3.1 起按目标分别计算）
 };
 
 // 日期工具：GitHub search 需要 YYYY-MM-DD
@@ -1038,6 +1038,8 @@ return new Response(html, { status: 500, headers: { "content-type": "text/html;c
 // v5.3 起频道可自动注册：Bot 被设为频道管理员后，Webhook 的 my_chat_member / channel_post 更新会把频道登记进 intel:tgchannels，自动成为推送目标，TG_CHANNEL_ID 退为可选手动覆盖。
 // 都未配置/未注册时功能静默不启用。每日一次门禁按目标分别判定：失败的目标可在当天后续巡检重试，已成功的目标当天不重发。
 // 推送状态存 intel:briefpush：{date, targets: {"dm"|"ch:<chatId>": {ok,ts}}}（v5.2 及更早的 {date, dm, channel} 旧格式在读取时自动迁移）。
+// 手动推送 POST /api/brief/push 在 v5.3.1 起需要鉴权：未配 Secret PUSH_KEY 时接口 403 关闭；请求须带请求头 x-push-key 且与 PUSH_KEY 一致，否则 401 且不推送、不写节流。
+// 手动节流 intel:pushmanual 同为按目标记录 {"dm"|"ch:<chatId>": ts}：只拦单个目标，新注册的频道无节流记录、可立即补推（旧全局格式在读取时迁移，见 loadPushManualStamps）。
 // 注意：推频道时 Bot 必须是该频道管理员，否则 Telegram 会拒绝。
 // ============================================================
 function cstParts(ts) {
@@ -1087,6 +1089,21 @@ if (raw.channel && typeof raw.channel === "object") {
 targets[env.TG_CHANNEL_ID? "ch:" + String(env.TG_CHANNEL_ID): "legacy:channel"] = raw.channel;
 }
 return { date: raw.date || null, targets};
+}
+// intel:pushmanual 旧格式迁移：v5.3 及更早存的是单个全局时间戳（裸数字或 {ts} 对象），v5.3.1 起改为按目标映射 {"dm"|"ch:<chatId>": ts}。
+// 旧时间戳一律视为只给 "dm" 目标打的戳——历史手动推送至少都包含私聊目标，频道从未被单独打戳，因此迁移后频道（尤其新注册的）仍可立即手动补推。
+async function loadPushManualStamps(env) {
+const raw = await loadJSON(env, CONFIG.kvPushManual, null);
+if (raw == null) return {};
+if (typeof raw === "number" && Number.isFinite(raw)) return { dm: raw};
+if (typeof raw === "object") {
+const keys = Object.keys(raw);
+if (typeof raw.ts === "number" && !keys.some((k) => k === "dm" || k.startsWith("ch:"))) return { dm: raw.ts};
+const out = {};
+for (const [k, v] of Object.entries(raw)) if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+return out;
+}
+return {};
 }
 // 解析全部推送目标：私聊（TG_CHAT_ID）+ 手动频道（TG_CHANNEL_ID，可选覆盖）+ 全部 status=active 的自动注册频道；按 chatId 去重
 async function resolvePushTargets(env) {
@@ -1393,19 +1410,30 @@ targets: bp.date === cstDateStr(Date.now())? bp.targets: {},
 return Response.json({ ok: true, brief});
 }
 if (url.pathname === "/api/brief/push" && request.method === "POST") {
-// 手动推送总统简报：发给全部推送目标（私聊 + 手动频道 + 自动注册频道），与每日自动推送共用 intel:briefpush 状态；自身有 6 小时节流（intel:pushmanual）
+// 手动推送总统简报（v5.3.1 起）：先鉴权——未配 Secret PUSH_KEY 时接口关闭（403 push_disabled）；请求头 x-push-key 与 PUSH_KEY 不一致时 401 unauthorized，
+// 且不推送、不写任何节流记录。鉴权通过后才解析目标：发给全部推送目标（私聊 + 手动频道 + 自动注册频道），与每日自动推送共用 intel:briefpush 状态；
+// 节流按目标分别判定（intel:pushmanual 为 {目标键: ts} 映射）：只推 6 小时内没被手动推过的目标，新注册频道无记录可立即补推。
+if (!env.PUSH_KEY) return Response.json({ ok: false, pushed: false, status: "push_disabled"}, { status: 403});
+if (request.headers.get("x-push-key") !== env.PUSH_KEY) return Response.json({ ok: false, pushed: false, status: "unauthorized"}, { status: 401});
 const targets = await resolvePushTargets(env);
 if (!targets.length) return Response.json({ ok: false, pushed: false, status: "not_configured"});
-const st = (await loadJSON(env, CONFIG.kvPushManual, {})) || {};
+const stamps = await loadPushManualStamps(env);
 const now = Date.now();
-if (st.ts && now - st.ts < CONFIG.pushThrottleMs) {
-return Response.json({ ok: true, pushed: false, status: "throttled", retryAfterMs: CONFIG.pushThrottleMs - (now - st.ts)});
+const eligible = targets.filter((t) => !(stamps[t.key] != null && now - stamps[t.key] < CONFIG.pushThrottleMs));
+const skipped = targets.filter((t) => !eligible.includes(t)).map((t) => t.key);
+if (!eligible.length) {
+const earliest = Math.min(...targets.map((t) => stamps[t.key] + CONFIG.pushThrottleMs));
+return Response.json({ ok: true, pushed: false, status: "throttled", retryAfterMs: earliest - now, targets: [], skipped});
 }
 const brief = await loadBrief(env);
-const results = await pushBriefToTargets(env, brief, targets);
+const results = await pushBriefToTargets(env, brief, eligible);
 const anyOk = Object.values(results).some(Boolean);
-if (anyOk) await env.INTEL_KV.put(CONFIG.kvPushManual, JSON.stringify({ ts: now}));
-return Response.json({ ok: anyOk, pushed: anyOk, status: anyOk? "pushed": "tg_failed", results});
+if (anyOk) {
+const next = { ...stamps};
+for (const t of eligible) next[t.key] = now;
+await env.INTEL_KV.put(CONFIG.kvPushManual, JSON.stringify(next));
+}
+return Response.json({ ok: anyOk, pushed: anyOk, status: anyOk? "pushed": "tg_failed", results, targets: eligible.map((t) => t.key), skipped});
 }
 if (url.pathname === "/api/watchlist" && request.method === "GET") {
 const latest = await loadJSON(env, CONFIG.kvLatest, { ts: 0, repos: []});
