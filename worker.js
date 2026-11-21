@@ -86,6 +86,8 @@ const SEEDS = [
 { repo: "Vincentwei1021/mg-styles-15", cat: "creator", note: "15 种 MG 动画风格的视觉规范沉淀"},
 { repo: "athemeroy/awesome-claude-5-5-videos", cat: "creator", note: "Claude 做视频的精选案例与工作流索引"},
 { repo: "joeseesun/opus-video-prompts", cat: "creator", note: "视频生成提示词的结构化模板"},
+{ repo: "chatfire-AI/huobao-drama", cat: "creator", note: "火宝短剧：AI 一站式短剧生成（一句话→剧本→成片全自动化），短剧工厂的工具底座"},
+{ repo: "Anil-matcha/AI-Youtube-Shorts-Generator", cat: "creator", note: "长视频转竖版短片：LLM 高光检测 + Whisper 转写 + 自动裁切，Opus Clip 的开源替代"},
 // — 网安 · 红队 · SRC —
 { repo: "elementalsouls/Claude-BugHunter", cat: "security", note: "用 Claude 做漏洞挖掘的 Bug Bounty 工作流"},
 { repo: "CallMeGuLab/dsh-purge-safe", cat: "security", note: "数据安全清理的安全处置流程与边界"},
