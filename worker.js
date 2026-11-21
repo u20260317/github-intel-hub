@@ -1,5 +1,5 @@
 // ============================================================
-// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试；v5.2：Telegram Bot 命令系统；v5.3：频道自动注册——Bot 被设为频道管理员后经 my_chat_member/channel_post 自动登记为推送目标；v5.3.1：手动推送接口加 PUSH_KEY 鉴权 + 节流改为按目标分别计算）
+// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试；v5.2：Telegram Bot 命令系统；v5.3：频道自动注册——Bot 被设为频道管理员后经 my_chat_member/channel_post 自动登记为推送目标；v5.3.1：手动推送接口加 PUSH_KEY 鉴权 + 节流改为按目标分别计算；v5.4：只读 GET 路由加边缘缓存——Cache API 读穿缓存 30 分钟、巡检写新数据后主动失效，重复访问不再重跑渲染/重读 KV）
 // 单文件 Cloudflare Worker：定时巡检 GitHub 热门仓库，做规则研判（热度/学习点/评级），
 // 以「黑客情报中心」风格暗色面板呈现。零依赖，数据存 KV（绑定名 INTEL_KV）。
 // 研判为规则引擎产出，非 AI 生成，面板与代码均如实标注「规则研判」。
@@ -24,6 +24,7 @@ kvPushManual: "intel:pushmanual",
 kvTgChannels: "intel:tgchannels",
 panelUrl: "https://github-intel-hub.u20261103.workers.dev", // 总统简报推送里的面板链接（换部署地址时改这里）
 pushThrottleMs: 6 * 3600 * 1000, // 手动推送 /api/brief/push 的节流：每个推送目标 6 小时最多手动推 1 次（v5.3.1 起按目标分别计算）
+cacheTtlSec: 1800, // 【v5.4】只读 GET 路由的边缘缓存 TTL（秒）：数据只在巡检时变化，巡检后会主动失效，TTL 只是兜底
 };
 
 // 日期工具：GitHub search 需要 YYYY-MM-DD
@@ -1379,8 +1380,7 @@ return new Response("ok");
 // ============================================================
 // 【核心模块】路由入口 — 面板、JSON 接口、TG 命令 Webhook、手动刷新（节流）、Cron 巡检
 // ============================================================
-export default {
-async fetch(request, env) {
+async function handleFetch(request, env) {
 const url = new URL(request.url);
 if (!env.INTEL_KV) {
 if (url.pathname.startsWith("/api/")) return Response.json({ ok: false, error: "KV 未绑定：请绑定变量名 INTEL_KV"}, { status: 500});
@@ -1454,14 +1454,87 @@ if (meta && meta.ts && Date.now() - meta.ts < CONFIG.refreshThrottleMs) {
 return Response.json({ ok: true, throttled: true, lastSweep: meta.ts, retryAfterMs: CONFIG.refreshThrottleMs - (Date.now() - meta.ts)});
 }
 const result = await runSweep(env);
+try { await purgeIntelCache(url.origin); } catch {} // 【v5.4】新数据已写入 KV：失效只读路由的边缘缓存（失效失败不影响巡检结果）
 return Response.json({ ok: result.ok!== false, throttled: false, sweep: result});
 }
 return new Response("not found", { status: 404});
+}
+
+// ============================================================
+// 【核心模块】边缘缓存 — 只读 GET 路由（面板 / /api/repos / /api/stats / /api/brief / /api/tg/commands）走 Cache API 读穿缓存：
+// 情报数据只在巡检时变化，故缓存 30 分钟且巡检后主动失效，重复访问不再重跑渲染、不再重读 KV（抗刷、省额度）。
+// 存入的副本不带 x-intel-cache 标记：命中时在返回副本上标 HIT，未命中标 MISS。空数据状态（首轮巡检前）与错误响应永不缓存；
+// caches 不可用（如本地测试环境）时自动降级为直读 KV，行为与无缓存时完全一致。
+// ============================================================
+const CACHE_PATHS = ["/", "/api/repos", "/api/stats", "/api/brief", "/api/tg/commands"];
+
+function intelCache() {
+try { return (typeof caches !== "undefined" && caches.default)? caches.default: null; } catch { return null; }
+}
+
+// 缓存键只取 origin + pathname：这些路由不看 query，忽略 query 差异，避免用 query 刷出大量缓存碎片
+function intelCacheKey(url) {
+return url.origin + url.pathname;
+}
+
+// 是否值得缓存：仅 200 且确有情报数据。判断只读响应副本、不额外读 KV。
+// 首轮巡检前的空数据状态不缓存（否则空面板会被缓存住）：stats 的 meta 为空、repos 的 count 为 0、brief 的 totals.repos 为 0、面板渲染了空库提示块。
+// /api/tg/commands 是静态清单、与 KV 数据无关，恒可缓存。
+async function intelCacheWorthStoring(pathname, res) {
+if (res.status!== 200) return false;
+try {
+if (pathname === "/api/tg/commands") return true;
+const ct = res.headers.get("content-type") || "";
+if (ct.includes("application/json")) {
+const body = await res.clone().json();
+if (pathname === "/api/repos") return (body.count || 0) > 0;
+if (pathname === "/api/stats") return body.meta != null;
+if (pathname === "/api/brief") return !!(body.brief && body.brief.totals && body.brief.totals.repos > 0);
+return false;
+}
+const html = await res.clone().text();
+return !html.includes('class="empty"');
+} catch { return false; }
+}
+
+// 巡检写入新数据后失效全部只读路由缓存：单个键删除失败互不影响，整体失败也绝不拖累巡检
+async function purgeIntelCache(base) {
+const cache = intelCache();
+if (!cache || !base) return;
+await Promise.all(CACHE_PATHS.map(async (p) => {
+try { await cache.delete(new URL(p, base).toString()); } catch {}
+}));
+}
+
+export default {
+async fetch(request, env, ctx) {
+const url = new URL(request.url);
+const cache = (request.method === "GET" && env.INTEL_KV && CACHE_PATHS.includes(url.pathname))? intelCache(): null;
+if (!cache) return handleFetch(request, env);
+const key = intelCacheKey(url);
+try {
+const hit = await cache.match(key);
+if (hit) {
+const out = new Response(hit.body, hit);
+out.headers.set("x-intel-cache", "HIT");
+return out;
+}
+} catch {}
+const res = await handleFetch(request, env);
+if (await intelCacheWorthStoring(url.pathname, res)) {
+res.headers.set("Cache-Control", "public, max-age=" + CONFIG.cacheTtlSec);
+const stored = res.clone(); // 先克隆再给返回响应标 MISS，保证存入的副本不带 x-intel-cache 标记
+const putP = Promise.resolve().then(() => cache.put(key, stored)).catch(() => {});
+if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(putP);
+}
+res.headers.set("x-intel-cache", "MISS");
+return res;
 },
 async scheduled(event, env, ctx) {
 // Cron 巡检不走手动节流（Cron 间隔本身远大于 30 分钟）；巡检成功后按每日门禁推送总统简报（未配置 TG 时静默跳过）
 ctx.waitUntil((async () => {
 const meta = await runSweep(env);
+try { await purgeIntelCache(CONFIG.panelUrl); } catch {} // 【v5.4】Cron 巡检同样失效边缘缓存（无请求上下文，用配置的面板地址拼缓存键）
 if (meta && meta.ok) await maybePushDailyBrief(env);
 })());
 },
