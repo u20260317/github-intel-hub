@@ -1,5 +1,5 @@
 // ============================================================
-// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗）
+// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试）
 // 单文件 Cloudflare Worker：定时巡检 GitHub 热门仓库，做规则研判（热度/学习点/评级），
 // 以「黑客情报中心」风格暗色面板呈现。零依赖，数据存 KV（绑定名 INTEL_KV）。
 // 研判为规则引擎产出，非 AI 生成，面板与代码均如实标注「规则研判」。
@@ -16,6 +16,13 @@ kvLatest: "intel:latest",
 kvPrev: "intel:prev",
 kvMeta: "intel:meta",
 kvSeedIds: "intel:seedids",
+kvSeedCursor: "intel:seedcursor",
+kvSeedLive: "intel:seedlive",
+kvTopicHist: "intel:topichist",
+kvBriefPush: "intel:briefpush",
+kvPushManual: "intel:pushmanual",
+panelUrl: "https://github-intel-hub.u20261103.workers.dev", // 总统简报推送里的面板链接（换部署地址时改这里）
+pushThrottleMs: 6 * 3600 * 1000, // 手动推送 /api/brief/push 的节流：6 小时最多 1 次
 };
 
 // 日期工具：GitHub search 需要 YYYY-MM-DD
@@ -82,21 +89,49 @@ const SEEDS = [
 { repo: "CallMeGuLab/dsh-purge-safe", cat: "security", note: "数据安全清理的安全处置流程与边界"},
 ];
 
-// 把种子与巡检数据合并：优先按仓库 id 匹配（种子 id 映射来自 KV intel:seedids，改名后仍可命中），兜底按 full_name 匹配；命中改名仓库时展示当前名与当前链接
-function buildWatchlist(repos, seedIds) {
+// 把种子与巡检数据合并，数据新鲜度三级兜底：
+// 1) 本轮巡检实时命中（优先按仓库 id 匹配，种子 id 映射来自 KV intel:seedids；兜底按 full_name 匹配；命中改名仓库时展示当前名与当前链接）
+// 2) 种子保鲜数据（KV intel:seedlive，巡检轮换单独抓取的结果，带 refreshed 与保鲜时间；保鲜发现改名时展示当前名并记 renamedFrom；404 记 gone 疑似删库）
+// 3) 种子静态信息（只有名字与人工学习点）
+function buildWatchlist(repos, seedIds, seedLive) {
 const byName = new Map((repos || []).map((r) => [r.full_name.toLowerCase(), r]));
 const byId = new Map((repos || []).filter((r) => r.id != null).map((r) => [String(r.id), r]));
 return SEEDS.map((s) => {
 let live;
 if (s.repo && seedIds && seedIds[s.repo] != null) live = byId.get(String(seedIds[s.repo]));
 if (!live && s.repo) live = byName.get(s.repo.toLowerCase());
-return {
-name: live? live.full_name: (s.repo || s.name),
-url: live? live.html_url: (s.repo? `https://github.com/${s.repo}`: s.url),
-cat: s.cat,
-catName: SEED_CATS[s.cat] || s.cat,
-note: s.note,
-live: live? { stars: live.stars, forks: live.forks, heat: live.heat, grade: live.grade, starDelta: live.starDelta, channels: live.channels}: null,
+const base = { cat: s.cat, catName: SEED_CATS[s.cat] || s.cat, note: s.note};
+if (live) {
+return {...base,
+name: live.full_name,
+url: live.html_url,
+live: { stars: live.stars, forks: live.forks, heat: live.heat, grade: live.grade, starDelta: live.starDelta, channels: live.channels},
+refreshed: null, renamedFrom: null, gone: false, goneTs: null,
+};
+}
+const sl = s.repo && seedLive? seedLive[s.repo]: null;
+if (sl && !sl.gone) {
+const curName = sl.name || s.repo;
+return {...base,
+name: curName,
+url: `https://github.com/${curName}`,
+live: null,
+refreshed: { stars: sl.stars || 0, forks: sl.forks || 0, pushedAt: sl.pushedAt || "", ts: sl.ts || 0},
+renamedFrom: sl.name && sl.name !== s.repo? s.repo: null,
+gone: false, goneTs: null,
+};
+}
+if (sl && sl.gone) {
+return {...base,
+name: s.repo || s.name,
+url: s.repo? `https://github.com/${s.repo}`: s.url,
+live: null, refreshed: null, renamedFrom: null, gone: true, goneTs: sl.ts || 0,
+};
+}
+return {...base,
+name: s.repo || s.name,
+url: s.repo? `https://github.com/${s.repo}`: s.url,
+live: null, refreshed: null, renamedFrom: null, gone: false, goneTs: null,
 };
 });
 }
@@ -119,6 +154,32 @@ throw new Error(`GitHub ${r.status}: ${body.slice(0, 160)}`);
 }
 const j = await r.json();
 return Array.isArray(j.items)? j.items: [];
+}
+
+// 种子保鲜抓取：走核心 Repos API 单独查一个仓库（改名仓库会重定向到新地址，响应 JSON 里是当前 full_name/id）；404 = 疑似删库
+async function fetchSeedRepo(env, fullName) {
+const url = `${CONFIG.apiBase}/repos/${fullName}`;
+const headers = {
+"user-agent": CONFIG.ua,
+"accept": "application/vnd.github+json",
+"x-github-api-version": "2022-11-28",
+};
+if (env.GITHUB_TOKEN) headers["authorization"] = `Bearer ${env.GITHUB_TOKEN}`;
+const r = await fetch(url, { headers});
+if (r.status === 404) return { gone: true};
+if (!r.ok) {
+const body = await r.text().catch(() => "");
+throw new Error(`GitHub ${r.status}: ${body.slice(0, 160)}`);
+}
+const j = await r.json();
+return {
+gone: false,
+id: typeof j.id === "number"? j.id: null,
+name: j.full_name || fullName,
+stars: j.stargazers_count || 0,
+forks: j.forks_count || 0,
+pushedAt: j.pushed_at || "",
+};
 }
 
 // GitHub 原始 item -> 情报库统一记录（id 为 GitHub 数字仓库 ID：仓库改名/转移时不变，是监控锚点）
@@ -151,6 +212,8 @@ return v == null? fallback: v;
 } catch { return fallback;}
 }
 
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function runSweep(env) {
 const channels = buildChannels();
 const oldLatest = await loadJSON(env, CONFIG.kvLatest, null);
@@ -172,11 +235,21 @@ for (const [k, v] of Object.entries(prev)) if (k !== "ts" && typeof v === "numbe
 const merged = new Map(); // full_name -> record
 const errors = {};
 const counts = {};
+const retriedChannels = [];
 let okChannels = 0;
 
 for (const ch of channels) {
+// 通道抓取失败（如未认证限额 403）时，间隔 2 秒重试一次；重试成功照常入库，重试过的通道记入 meta.retriedChannels
+let items = null;
+let lastErr = null;
 try {
-const items = await fetchChannel(env, ch);
+items = await fetchChannel(env, ch);
+} catch (e1) {
+retriedChannels.push(ch.key);
+await sleepMs(2000);
+try { items = await fetchChannel(env, ch); } catch (e2) { lastErr = e2; }
+}
+if (items) {
 okChannels++;
 counts[ch.key] = items.length;
 for (const it of items) {
@@ -187,8 +260,8 @@ if (!ex.channels.includes(ch.key)) ex.channels.push(ch.key);
 ex.stars = Math.max(ex.stars, rec.stars);
 } else merged.set(rec.full_name, rec);
 }
-} catch (e) {
-errors[ch.key] = String(e.message || e).slice(0, 200);
+} else {
+errors[ch.key] = String((lastErr && lastErr.message) || lastErr || "unknown error").slice(0, 200);
 counts[ch.key] = 0;
 // 该通道失败：沿用上一轮带此通道标记的旧记录，避免整片数据被抹掉
 if (oldLatest && Array.isArray(oldLatest.repos)) {
@@ -249,7 +322,49 @@ if (hit && hit.id != null) seedIds[s.repo] = hit.id;
 }
 await env.INTEL_KV.put(CONFIG.kvSeedIds, JSON.stringify(seedIds));
 
-const meta = { ts, ok: true, counts, errors, total: repos.length, newCount, channelsOk: okChannels, channelsTotal: channels.length, renames};
+// 【v5】种子保鲜轮换：未被本轮巡检命中的种子，用游标（intel:seedcursor）轮换、每轮最多单独抓 3 个（核心 Repos API），
+// 结果存 intel:seedlive 供面板/buildWatchlist 兜底展示；抓到改名仓库时顺带把当前 id 回写 intel:seedids
+const seedLive = (await loadJSON(env, CONFIG.kvSeedLive, {})) || {};
+const repoSeeds = SEEDS.filter((s) => s.repo);
+let seedCursor = await loadJSON(env, CONFIG.kvSeedCursor, 0);
+if (!Number.isInteger(seedCursor) || seedCursor < 0 || seedCursor >= Math.max(1, repoSeeds.length)) seedCursor = 0;
+let seedRefreshed = 0;
+if (repoSeeds.length) {
+const isMatched = (s) => (seedIds[s.repo] != null && byIdNow.has(String(seedIds[s.repo]))) || byNameNow.has(s.repo.toLowerCase());
+let idx = seedCursor;
+let lastAttempted = -1;
+for (let scanned = 0; scanned < repoSeeds.length && seedRefreshed < 3; scanned++) {
+const s = repoSeeds[idx];
+if (!isMatched(s)) {
+try {
+const res = await fetchSeedRepo(env, s.repo);
+if (res.gone) {
+seedLive[s.repo] = { gone: true, ts: Date.now()};
+} else {
+seedLive[s.repo] = { id: res.id, name: res.name, stars: res.stars, forks: res.forks, pushedAt: res.pushedAt, ts: Date.now()};
+if (res.id != null) seedIds[s.repo] = res.id;
+}
+} catch (e) {
+// 非 404 错误（限流/网络）：不标记删库，保留旧保鲜数据，下一轮轮到时再试
+}
+seedRefreshed++;
+lastAttempted = idx;
+}
+idx = (idx + 1) % repoSeeds.length;
+}
+if (lastAttempted >= 0) seedCursor = (lastAttempted + 1) % repoSeeds.length;
+}
+await env.INTEL_KV.put(CONFIG.kvSeedCursor, JSON.stringify(seedCursor));
+await env.INTEL_KV.put(CONFIG.kvSeedLive, JSON.stringify(seedLive));
+await env.INTEL_KV.put(CONFIG.kvSeedIds, JSON.stringify(seedIds));
+
+// 【v5】话题趋势历史：本轮 topics 聚合（只留累计星标前 40）追加进 intel:topichist，只保留最近 56 个快照（6 小时一轮 ≈ 14 天）
+const topicHist = (await loadJSON(env, CONFIG.kvTopicHist, [])) || [];
+topicHist.push({ ts, topics: aggregateTopics(repos)});
+while (topicHist.length > 56) topicHist.shift();
+await env.INTEL_KV.put(CONFIG.kvTopicHist, JSON.stringify(topicHist));
+
+const meta = { ts, ok: true, counts, errors, total: repos.length, newCount, channelsOk: okChannels, channelsTotal: channels.length, renames, retriedChannels, seedRefreshed};
 await env.INTEL_KV.put(CONFIG.kvLatest, JSON.stringify(latest));
 await env.INTEL_KV.put(CONFIG.kvPrev, JSON.stringify(newPrev));
 await env.INTEL_KV.put(CONFIG.kvMeta, JSON.stringify(meta));
@@ -409,7 +524,47 @@ for (const t of r.learnTags || []) freq[t] = (freq[t] || 0) + 1;
 }
 return freq;
 }
-function buildBrief(repos, meta, seedIds) {
+// 【v5】话题聚合与趋势：aggregateTopics 把一轮仓库的 topics 聚合成 {topic:{n: 仓库数, s: 累计星标}}，只留累计星标前 40
+function aggregateTopics(repos) {
+const agg = {};
+for (const r of repos || []) for (const t of r.topics || []) {
+const e = agg[t] || (agg[t] = { n: 0, s: 0});
+e.n++;
+e.s += r.stars || 0;
+}
+const top = Object.entries(agg).sort((a, b) => b[1].s - a[1].s || b[1].n - a[1].n).slice(0, 40);
+const out = {};
+for (const [t, v] of top) out[t] = v;
+return out;
+}
+// 趋势计算：与约 24 小时前（取时间上最接近的那个历史快照）比星标/仓库数增量；
+// streak = 从最新快照往回数、累计星标连续严格递增的轮数（含本轮）。只返回 24h 星标增量为正的前 5 个话题
+function computeTrendingTopics(topicHist) {
+if (!Array.isArray(topicHist) || topicHist.length < 2) return [];
+const cur = topicHist[topicHist.length - 1];
+const target = cur.ts - 86400000;
+let base = null, bestDiff = Infinity;
+for (let i = 0; i < topicHist.length - 1; i++) {
+const d = Math.abs(topicHist[i].ts - target);
+if (d < bestDiff) { bestDiff = d; base = topicHist[i]; }
+}
+if (!base) return [];
+const starsAt = (snap, t) => (snap.topics && snap.topics[t])? snap.topics[t].s: 0;
+const out = [];
+for (const [topic, v] of Object.entries(cur.topics || {})) {
+const old = (base.topics && base.topics[topic]) || { n: 0, s: 0};
+const dStars = v.s - old.s;
+if (dStars <= 0) continue;
+let streak = 0;
+for (let i = topicHist.length - 1; i >= 1; i--) {
+if (starsAt(topicHist[i], topic) > starsAt(topicHist[i - 1], topic)) streak++;
+else break;
+}
+out.push({ topic, dStars24h: dStars, dCount24h: v.n - old.n, streak});
+}
+return out.sort((a, b) => b.dStars24h - a.dStars24h).slice(0, 5);
+}
+function buildBrief(repos, meta, seedIds, seedLive, topicHist) {
 repos = Array.isArray(repos)? repos: [];
 const byDelta = repos.filter((r) => typeof r.starDelta === "number").sort((a, b) => b.starDelta - a.starDelta).slice(0, 3);
 const byHeat = [...repos].sort((a, b) => (b.heat || 0) - (a.heat || 0)).slice(0, 3);
@@ -419,7 +574,7 @@ const topSecTags = Object.entries(secTagFreq(repos)).sort((a, b) => b[1] - a[1])
 .map(([tag, count]) => ({ tag, count}));
 const skillTop = repos.filter((r) => (r.channels || []).includes("skills"))
 .sort((a, b) => (b.heat || 0) - (a.heat || 0))[0] || null;
-const wl = buildWatchlist(repos, seedIds);
+const wl = buildWatchlist(repos, seedIds, seedLive);
 const liveSeeds = wl.filter((w) => w.live);
 // 改名动态：优先从仓库记录的 renamedFrom 还原，其次用巡检 meta 里记录的改名事件
 let renames = repos.filter((r) => r.renamedFrom).map((r) => ({ from: r.renamedFrom, to: r.full_name, stars: r.stars}));
@@ -462,6 +617,7 @@ top: topSeed? { name: topSeed.name, url: topSeed.url, stars: topSeed.live.stars}
 },
 renames,
 topTopics,
+trendingTopics: computeTrendingTopics(topicHist),
 oneliner,
 };
 }
@@ -469,8 +625,10 @@ async function loadBrief(env) {
 const latest = await loadJSON(env, CONFIG.kvLatest, null);
 const meta = await loadJSON(env, CONFIG.kvMeta, null);
 const seedIds = (await loadJSON(env, CONFIG.kvSeedIds, {})) || {};
+const seedLive = (await loadJSON(env, CONFIG.kvSeedLive, {})) || {};
+const topicHist = (await loadJSON(env, CONFIG.kvTopicHist, [])) || [];
 const repos = latest && Array.isArray(latest.repos)? latest.repos: [];
-return buildBrief(repos, meta, seedIds);
+return buildBrief(repos, meta, seedIds, seedLive, topicHist);
 }
 function briefLine(r, suffix) {
 if (!r) return `<div class="bline muted">暂无数据</div>`;
@@ -485,9 +643,10 @@ const skill = b.skillsFocus? briefLine(b.skillsFocus): `<div class="bline muted"
 const wl = `<div class="bline">已命中实时数据 <b>${b.watchlistLive.liveCount}</b> / ${b.watchlistLive.total} 个种子</div>` +
 (b.watchlistLive.top? `<div class="bline">领跑种子：<a href="${esc(b.watchlistLive.top.url)}" target="_blank" rel="noopener">${esc(b.watchlistLive.top.name)}</a> <span class="bmeta">★ ${b.watchlistLive.top.stars}</span></div>`: "");
 const topicsLine = (b.topTopics && b.topTopics.length)? `<div class="bline">关键词热度：${b.topTopics.map((t) => esc(t.topic) + "（" + t.count + " 仓 · ★" + t.stars + "）").join(" · ")}</div>`: "";
+const trendHtml = (b.trendingTopics && b.trendingTopics.length)? `<h4>【话题趋势】</h4>` + b.trendingTopics.map((t) => `<div class="bline">${esc(t.topic)} <span class="bmeta">+${t.dStars24h}★/24h · 连续 ${t.streak} 轮升温</span></div>`).join(""): "";
 const renameHtml = (b.renames && b.renames.length)? `<h4>【改名动态】</h4>` + b.renames.map((r) => `<div class="bline">改名动态：${esc(r.from)} → <a href="https://github.com/${esc(r.to)}" target="_blank" rel="noopener">${esc(r.to)}</a> <span class="bmeta">★ ${r.stars}</span></div>`).join(""): "";
 return `<h4>【今日态势】</h4><p class="boneliner">${esc(b.oneliner)}</p>${topicsLine}
-<h4>【飙升 TOP3】</h4>${surge}
+${trendHtml}<h4>【飙升 TOP3】</h4>${surge}
 <h4>【热度 TOP3】</h4>${heat}
 <h4>【网安焦点】</h4>${secTop}${secTags}
 <h4>【Skill 焦点】</h4>${skill}
@@ -546,8 +705,13 @@ else pages.push(1, 2, "…", totalPages - 1, totalPages);
 return pages.map((p) => p === "…"? `<span class="pgdots">…</span>`: `<button class="fbtn pgnum${p === 1? " on": ""}" data-page="${p}">${p}</button>`).join("");
 })();
 const seedIds = (await loadJSON(env, CONFIG.kvSeedIds, {})) || {};
-const watchlist = buildWatchlist(repos, seedIds);
-const brief = buildBrief(repos, meta, seedIds);
+const seedLive = (await loadJSON(env, CONFIG.kvSeedLive, {})) || {};
+const topicHist = (await loadJSON(env, CONFIG.kvTopicHist, [])) || {};
+const watchlist = buildWatchlist(repos, seedIds, seedLive);
+const brief = buildBrief(repos, meta, seedIds, seedLive, topicHist);
+// 【v5】话题趋势行：紧贴热门标签云下方，一行纯文本 chip（非链接），历史不足两轮时不渲染
+const trending = brief.trendingTopics || [];
+const trendLine = trending.length? `<div class="tagrow"><span class="taglabel">📈 话题趋势</span>${trending.map((t) => `<span class="tag">${esc(t.topic)} +${t.dStars24h}★/24h · 连续 ${t.streak} 轮升温</span>`).join("")}</div>`: "";
 const showMoreBtn = (gid, n) => n > 6? `<button class="btn showmore" type="button" data-showmore="${gid}" data-label="展开全部 ${n} 条 ▾">展开全部 ${n} 条 ▾</button>`: "";
 const topHeat = repos.length? Math.max(...repos.map((r) => r.heat || 0)): 0;
 const newCount = meta? meta.newCount || 0: 0;
@@ -556,7 +720,16 @@ const newCount = meta? meta.newCount || 0: 0;
 const seedGroups = [...new Set(SEEDS.map((s) => s.cat))].map((cat) => {
 const items = watchlist.filter((w) => w.cat === cat);
 const cards = items.map((w) => {
-const live = w.live? `<div class="meta">★ ${w.live.stars} · 热度 ${w.live.heat} · ${esc(w.live.grade || "B")}级${typeof w.live.starDelta === "number"? ` · <span class="delta ${w.live.starDelta >= 0? "up": "down"}">${w.live.starDelta >= 0? "+": ""}${w.live.starDelta}★ 本轮</span>`: ""}</div>`: `<div class="meta">未在本轮巡检命中 · 点名监控中</div>`;
+let live;
+if (w.live) {
+live = `<div class="meta">★ ${w.live.stars} · 热度 ${w.live.heat} · ${esc(w.live.grade || "B")}级${typeof w.live.starDelta === "number"? ` · <span class="delta ${w.live.starDelta >= 0? "up": "down"}">${w.live.starDelta >= 0? "+": ""}${w.live.starDelta}★ 本轮</span>`: ""}</div>`;
+} else if (w.refreshed) {
+live = `<div class="meta">★ ${w.refreshed.stars} · ⑂ ${w.refreshed.forks} · <span class="delta up">单独保鲜</span> ${esc(fmtCST(w.refreshed.ts))}${w.renamedFrom? ` · <span class="delta down">原 ${esc(w.renamedFrom)} 已改名</span>`: ""}</div>`;
+} else if (w.gone) {
+live = `<div class="meta">⚠️ 疑似删库/改名未追踪（保鲜检查 ${esc(fmtCST(w.goneTs))}）</div>`;
+} else {
+live = `<div class="meta">未在本轮巡检命中 · 点名监控中</div>`;
+}
 return `<article class="card seed"><div class="chead"><a class="rname" href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.name)}</a><span class="tag">${esc(w.catName)}</span></div>
 <p class="desc">学习点：${esc(w.note)}</p>${live}</article>`;
 }).join("");
@@ -593,11 +766,12 @@ h2{color:#67e8f9;letter-spacing:2px;font-size:18px;text-shadow:0 0 10px rgba(103
 .card{border:1px solid #14532d;background:rgba(8,16,12,.92);border-radius:6px;padding:14px;transition:box-shadow .25s,border-color .25s,transform .25s}
 .card:hover{border-color:#22c55e;box-shadow:0 0 18px rgba(74,222,128,.28),0 0 42px rgba(103,232,249,.10);transform:translateY(-2px)}
 .rank{color:#0a0e12;background:#4ade80;border-radius:4px;font-weight:700;padding:0 6px;margin-right:7px;font-size:12px}
-.topbar{position:sticky;top:0;z-index:30;background:rgba(10,14,18,.93);backdrop-filter:blur(7px);border-bottom:1px solid #14532d;padding:10px 0 12px;margin-bottom:6px}
+.stickyhead{position:sticky;top:0;z-index:50;background:rgba(10,14,18,.97);backdrop-filter:blur(7px);border-bottom:1px solid #14532d;padding:10px 0 12px;margin-bottom:6px}
+.topbar{padding-bottom:2px}
 .toprow{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap}
 .clockbox{text-align:right;color:#67e8f9;font-size:13px;line-height:1.6}
 .clockbox b{color:#4ade80;font-size:17px;text-shadow:0 0 9px rgba(74,222,128,.55)}
-.filterbar{position:sticky;top:86px;z-index:20;background:rgba(10,14,18,.95);padding:9px 0;border-bottom:1px dashed #14532d}
+.filterbar{padding:8px 0 2px;border-top:1px dashed #14532d;margin-top:8px}
 .seedcat{color:#facc15;letter-spacing:1px;font-size:15px;margin:18px 0 10px;text-shadow:0 0 8px rgba(250,204,21,.35)}
 .card.seed{border-color:#3f6212}
 .chead{display:flex;justify-content:space-between;gap:8px;align-items:flex-start}
@@ -656,10 +830,15 @@ h2.sechead:hover{color:#a5f3fc}
 .brief-foot{padding:8px 14px;border-top:1px dashed #14532d;color:#5f7a68;font-size:12px}
 @media (max-width:520px){#brief-panel{width:92vw}}
 </style></head><body><div class="wrap">
+<div class="stickyhead">
 <div class="topbar"><div class="toprow">
 <div><h1>◢ GitHub 情报中心</h1><div class="sub">GITHUB INTEL CENTER // 开源情报巡检 · 规则研判 · 非 AI 生成</div></div>
 <div class="clockbox"><div>北京时间 CST <b id="clock">--:--:--</b></div><div>巡检状态：${meta? (meta.ok? "✅ 正常": "⚠️ 异常") + " · " + esc(fmtCST(meta.ts)): "尚无数据"} · 通道 ${meta? (meta.channelsOk?? "-"): "-"}/${channels.length}</div></div>
 </div></div>
+<div class="tagrow" id="tag-cloud"><span class="taglabel">🏷 热门标签（点标签筛选全部情报）</span>${tagCloud || '<span class="muted">暂无标签数据</span>'}</div>
+<div class="filterbar"><div>${filterBtns}</div>
+<div><button class="fbtn on" data-gf="all">评级 全部</button><button class="fbtn" data-gf="S">S 级</button><button class="fbtn" data-gf="A">A 级</button><button class="fbtn" data-gf="B">B 级</button><input type="search" id="q" placeholder="🔍 搜仓库名 / 描述 / 语言"><span class="muted" id="shown"></span><span id="tag-pill" class="tagpill" style="display:none">标签：<b id="tag-name"></b> <button class="fbtn" id="tag-clear" type="button">✕ 清除标签</button></span></div><div style="margin-top:6px"><button class="fbtn" id="btn-expand-all" type="button">全部展开</button><button class="fbtn" id="btn-collapse-all" type="button">全部收起</button></div></div>
+</div>
 <div class="ticker"><span>${esc(tickerText)} &nbsp;///&nbsp; ${esc(tickerText)}</span></div>
 <div class="kpis">
 <div class="kpi"><span>监控仓库数</span><b>${repos.length}</b></div>
@@ -677,7 +856,7 @@ h2.sechead:hover{color:#a5f3fc}
 ${empty}
 <h2>◢ 情报总览 INTEL OVERVIEW</h2>
 <p class="muted">本面板追踪 GitHub 热门仓库：飙升榜按本轮星标增量排序（需至少两轮巡检才有增量），其余按热度分排序。热度分 = 星标规模 + 本轮增量 + 推送新鲜度 + fork 活跃度的规则加权；学习点为关键词规则映射；评级 S ≥70、A ≥45、B 其余。</p>
-<div class="tagrow" id="tag-cloud"><span class="taglabel">🏷 热门标签（点标签筛选全部情报）</span>${tagCloud || '<span class="muted">暂无标签数据</span>'}</div>
+${trendLine}
 <h2 class="sechead" data-collapse="sec-surge"><span>◢ 飙升榜 STAR SURGE</span><span class="ctog">▼</span></h2>
 <div class="secbody" id="sec-surge"><div class="grid showcase${surgeList.length > 6? " clipped": ""}" id="g-surge">${surgeList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-surge", surgeList.length)}</div>
 <h2 class="sechead" data-collapse="sec-newstars"><span>◢ 热门新星 NEW STARS</span><span class="ctog">▼</span></h2>
@@ -697,14 +876,12 @@ ${empty}
 <div class="secbody" id="sec-creator"><div class="grid showcase${creatorList.length > 6? " clipped": ""}" id="g-creator">${creatorList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-creator", creatorList.length)}</div>
 <h2 class="sechead" data-collapse="sec-watchlist"><span>◢ 重点监控 WATCHLIST</span><span class="ctog">▼</span></h2>
 <div class="secbody" id="sec-watchlist">
-<p class="muted">人工精选种子清单（已预筛）：Skill 生态 / 写作 / 科研 / 自媒体 / 网安五类。种子若被本轮巡检命中，卡片会带其实时 ★、热度与本轮增量；未命中则标注「点名监控中」。种子学习点为人工研判，与规则研判区分。</p>
+<p class="muted">人工精选种子清单（已预筛）：Skill 生态 / 写作 / 科研 / 自媒体 / 网安五类。种子若被本轮巡检命中，卡片会带其实时 ★、热度与本轮增量；未命中的种子由巡检按游标轮换「单独保鲜」（每轮最多 3 个，卡片标注保鲜时间），保鲜时发现改名会显示当前名、404 会标注疑似删库；都还没轮到的标注「点名监控中」。种子学习点为人工研判，与规则研判区分。</p>
 ${seedGroups}
 </div>
 <h2 id="all-intel" class="sechead" data-collapse="sec-all"><span>◢ 全部情报 ALL INTEL</span><span class="ctog">▼</span></h2>
 <div class="secbody" id="sec-all">
 <div class="pager prominent" id="pager-top"><button class="fbtn pg-prev" type="button">← 上一页</button><span class="pg-nums">${pagerBtns}</span><button class="fbtn pg-next" type="button">下一页 →</button><span class="muted pg-status"></span></div>
-<div class="filterbar"><div>${filterBtns}</div>
-<div><button class="fbtn on" data-gf="all">评级 全部</button><button class="fbtn" data-gf="S">S 级</button><button class="fbtn" data-gf="A">A 级</button><button class="fbtn" data-gf="B">B 级</button><input type="search" id="q" placeholder="🔍 搜仓库名 / 描述 / 语言"><span class="muted" id="shown"></span><span id="tag-pill" class="tagpill" style="display:none">标签：<b id="tag-name"></b> <button class="fbtn" id="tag-clear" type="button">✕ 清除标签</button></span></div><div style="margin-top:6px"><button class="fbtn" id="btn-expand-all" type="button">全部展开</button><button class="fbtn" id="btn-collapse-all" type="button">全部收起</button></div></div>
 <div class="grid" id="all-grid">${repos.map((r, i) => repoCard(r, i + 1)).join("")}</div>
 <div class="pager prominent" id="pager-bottom"><button class="fbtn pg-prev" type="button">← 上一页</button><span class="pg-nums">${pagerBtns}</span><button class="fbtn pg-next" type="button">下一页 →</button><span class="muted pg-status"></span></div>
 <p class="muted">数据源：GitHub Search API（公开接口，未认证时限额约 10 次/分钟、每小时搜索配额有限；配置 GITHUB_TOKEN 可提高）。星标增量需至少两轮巡检对比快照得出，第一轮均为「新入情报库」。本站研判均为规则引擎产出，重点监控种子的学习点为人工撰写，均不构成推荐结论。</p>
@@ -849,6 +1026,118 @@ return new Response(html, { status: 500, headers: { "content-type": "text/html;c
 }
 
 // ============================================================
+// 【核心模块】总统简报 Telegram 推送 — 可选 Secret：TG_BOT_TOKEN + TG_CHAT_ID（Bot 私聊）和/或 TG_CHANNEL_ID（频道，可填 @频道名 或 -100… 数字 id）；
+// 都未配置时功能静默不启用。每日一次门禁按目标分别判定：失败的目标可在当天后续巡检重试，已成功的目标当天不重发。
+// 推送状态存 intel:briefpush：{date, dm:{ok,ts}, channel:{ok,ts}}。注意：推频道时 Bot 必须是该频道管理员，否则 Telegram 会拒绝。
+// ============================================================
+function cstParts(ts) {
+const parts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23"}).formatToParts(new Date(ts));
+const o = {};
+for (const p of parts) o[p.type] = p.value;
+return { y: o.year, mo: o.month, d: o.day, hh: parseInt(o.hour, 10) || 0, mm: parseInt(o.minute, 10) || 0};
+}
+function cstDateStr(ts) {
+const p = cstParts(ts);
+return `${p.y}-${p.mo}-${p.d}`;
+}
+// 已配置的推送目标：有 TG_BOT_TOKEN 且配了对应 chat id 才算
+function pushTargets(env) {
+const targets = [];
+if (env.TG_BOT_TOKEN && env.TG_CHAT_ID) targets.push({ key: "dm", chatId: String(env.TG_CHAT_ID)});
+if (env.TG_BOT_TOKEN && env.TG_CHANNEL_ID) targets.push({ key: "channel", chatId: String(env.TG_CHANNEL_ID)});
+return targets;
+}
+function tgEsc(s) {
+return String(s?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+// 简报的 Telegram 文本版（HTML 解析模式）：与 Web 简报同结构，控制在约 1800 字内（不带逐条研判，靠链接回面板看详情）
+function buildBriefText(b) {
+const p = cstParts(Date.now());
+const repoLine = (r, withDelta) => r
+? `<a href="${tgEsc(r.url)}">${tgEsc(r.name)}</a> ★${r.stars}${withDelta && typeof r.delta === "number"? `（${r.delta >= 0? "+": ""}${r.delta}★ 本轮）`: ""}`
+: "暂无";
+const lines = [];
+lines.push(`📋 <b>GitHub 情报中心 · 总统简报（${p.mo}-${p.d}）</b>`);
+lines.push("");
+lines.push(`【今日态势】${tgEsc(b.oneliner)}`);
+lines.push("");
+lines.push("【飙升 TOP3】");
+if (b.topSurging && b.topSurging.length) b.topSurging.forEach((r, i) => lines.push(`${i + 1}. ${repoLine(r, true)}`));
+else lines.push("暂无增量数据（需两轮巡检）");
+lines.push("");
+lines.push("【热度 TOP3】");
+if (b.topHeat && b.topHeat.length) b.topHeat.forEach((r, i) => lines.push(`${i + 1}. ${repoLine(r, false)}`));
+else lines.push("暂无数据");
+lines.push("");
+const secTop = b.securityFocus? b.securityFocus.top: null;
+lines.push(`【网安焦点】${repoLine(secTop, false)}`);
+if (b.securityFocus && b.securityFocus.topTags && b.securityFocus.topTags.length) {
+lines.push(`热门标签：${b.securityFocus.topTags.map((t) => tgEsc(t.tag) + " ×" + t.count).join(" · ")}`);
+}
+if (b.trendingTopics && b.trendingTopics.length) {
+lines.push("");
+lines.push("【话题趋势】");
+for (const t of b.trendingTopics) lines.push(`${tgEsc(t.topic)} +${t.dStars24h}★/24h · 连续 ${t.streak} 轮升温`);
+}
+if (b.renames && b.renames.length) {
+lines.push("");
+lines.push("【改名动态】");
+for (const r of b.renames) lines.push(`${tgEsc(r.from)} → <a href="https://github.com/${tgEsc(r.to)}">${tgEsc(r.to)}</a>`);
+}
+lines.push("");
+lines.push(`<a href="${CONFIG.panelUrl}">打开情报面板 →</a>`);
+let text = lines.join("\n");
+if (text.length > 1800) {
+const cut = text.lastIndexOf("\n", 1790);
+text = text.slice(0, cut > 0? cut: 1790) + "\n…";
+}
+return text;
+}
+async function sendTelegramTo(env, chatId, text) {
+try {
+const r = await fetch(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`, {
+method: "POST",
+headers: { "content-type": "application/json"},
+body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true}),
+});
+const j = await r.json().catch(() => null);
+return !!(j && j.ok === true);
+} catch { return false; }
+}
+// 把简报发给给定目标列表，并把每个目标的结果（ok/时间）合并写回 intel:briefpush（跨天自动重置）
+async function pushBriefToTargets(env, brief, targets) {
+const text = buildBriefText(brief);
+const now = Date.now();
+const today = cstDateStr(now);
+let state = (await loadJSON(env, CONFIG.kvBriefPush, {})) || {};
+if (state.date !== today) state = { date: today};
+const results = {};
+for (const t of targets) {
+const ok = await sendTelegramTo(env, t.chatId, text);
+results[t.key] = ok;
+state[t.key] = { ok, ts: now};
+}
+await env.INTEL_KV.put(CONFIG.kvBriefPush, JSON.stringify(state));
+return results;
+}
+// 每日自动推送门禁：CST 08:00 之后、且当天该目标还没推送成功过，才补发（失败目标当天后续巡检会重试）
+async function maybePushDailyBrief(env) {
+const targets = pushTargets(env);
+if (!targets.length) return { pushed: false, reason: "not_configured"};
+const now = Date.now();
+const p = cstParts(now);
+if (p.hh * 60 + p.mm < 8 * 60) return { pushed: false, reason: "before_0800"};
+const today = cstDateStr(now);
+const state = (await loadJSON(env, CONFIG.kvBriefPush, {})) || {};
+const dayState = state.date === today? state: {};
+const due = targets.filter((t) => !(dayState[t.key] && dayState[t.key].ok));
+if (!due.length) return { pushed: false, reason: "already_today"};
+const brief = await loadBrief(env);
+const results = await pushBriefToTargets(env, brief, due);
+return { pushed: Object.values(results).some(Boolean), results};
+}
+
+// ============================================================
 // 【核心模块】路由入口 — 面板、JSON 接口、手动刷新（节流）、Cron 巡检
 // ============================================================
 export default {
@@ -862,14 +1151,39 @@ if (url.pathname === "/" && request.method === "GET") return renderPanel(env);
 if (url.pathname === "/api/repos" && request.method === "GET") {
 const latest = await loadJSON(env, CONFIG.kvLatest, { ts: 0, repos: []});
 const repos = latest.repos || [];
-return Response.json({ ok: true, ts: latest.ts || 0, count: repos.length, repos, watchlist: buildWatchlist(repos, (await loadJSON(env, CONFIG.kvSeedIds, {})) || {})});
+return Response.json({ ok: true, ts: latest.ts || 0, count: repos.length, repos, watchlist: buildWatchlist(repos, (await loadJSON(env, CONFIG.kvSeedIds, {})) || {}, (await loadJSON(env, CONFIG.kvSeedLive, {})) || {})});
 }
 if (url.pathname === "/api/brief" && request.method === "GET") {
-return Response.json({ ok: true, brief: await loadBrief(env)});
+const brief = await loadBrief(env);
+const bp = (await loadJSON(env, CONFIG.kvBriefPush, {})) || {};
+const dayState = bp.date === cstDateStr(Date.now())? bp: {};
+brief.push = {
+configured: { dm: !!(env.TG_BOT_TOKEN && env.TG_CHAT_ID), channel: !!(env.TG_BOT_TOKEN && env.TG_CHANNEL_ID)},
+anyConfigured: pushTargets(env).length > 0,
+lastPushDate: bp.date || null,
+dm: dayState.dm || null,
+channel: dayState.channel || null,
+};
+return Response.json({ ok: true, brief});
+}
+if (url.pathname === "/api/brief/push" && request.method === "POST") {
+// 手动推送总统简报：发给全部已配置目标（私聊 + 频道），与每日自动推送共用 intel:briefpush 状态；自身有 6 小时节流（intel:pushmanual）
+const targets = pushTargets(env);
+if (!targets.length) return Response.json({ ok: false, pushed: false, status: "not_configured"});
+const st = (await loadJSON(env, CONFIG.kvPushManual, {})) || {};
+const now = Date.now();
+if (st.ts && now - st.ts < CONFIG.pushThrottleMs) {
+return Response.json({ ok: true, pushed: false, status: "throttled", retryAfterMs: CONFIG.pushThrottleMs - (now - st.ts)});
+}
+const brief = await loadBrief(env);
+const results = await pushBriefToTargets(env, brief, targets);
+const anyOk = Object.values(results).some(Boolean);
+if (anyOk) await env.INTEL_KV.put(CONFIG.kvPushManual, JSON.stringify({ ts: now}));
+return Response.json({ ok: anyOk, pushed: anyOk, status: anyOk? "pushed": "tg_failed", results});
 }
 if (url.pathname === "/api/watchlist" && request.method === "GET") {
 const latest = await loadJSON(env, CONFIG.kvLatest, { ts: 0, repos: []});
-const watchlist = buildWatchlist(latest.repos || [], (await loadJSON(env, CONFIG.kvSeedIds, {})) || {});
+const watchlist = buildWatchlist(latest.repos || [], (await loadJSON(env, CONFIG.kvSeedIds, {})) || {}, (await loadJSON(env, CONFIG.kvSeedLive, {})) || {});
 return Response.json({ ok: true, count: watchlist.length, watchlist});
 }
 if (url.pathname === "/api/stats" && request.method === "GET") {
@@ -887,7 +1201,10 @@ return Response.json({ ok: result.ok!== false, throttled: false, sweep: result})
 return new Response("not found", { status: 404});
 },
 async scheduled(event, env, ctx) {
-// Cron 巡检不走手动节流（Cron 间隔本身远大于 30 分钟）
-ctx.waitUntil(runSweep(env));
+// Cron 巡检不走手动节流（Cron 间隔本身远大于 30 分钟）；巡检成功后按每日门禁推送总统简报（未配置 TG 时静默跳过）
+ctx.waitUntil((async () => {
+const meta = await runSweep(env);
+if (meta && meta.ok) await maybePushDailyBrief(env);
+})());
 },
 };
