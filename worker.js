@@ -616,6 +616,8 @@ button.tag{font-family:inherit;background:transparent}
 .tagchip{cursor:pointer;transition:background .2s,box-shadow .2s}.tagchip:hover{background:#164e63;box-shadow:0 0 9px rgba(103,232,249,.45)}
 .cloudchip{font-size:13px;padding:3px 12px}
 .tagcloud{margin:0 0 14px;line-height:2}
+.tagrow{margin:2px 0 8px;line-height:2.1;padding:6px 8px;border:1px dashed #14532d;background:rgba(20,83,45,.12)}
+.tagrow .taglabel{color:#4ade80;font-weight:700;margin-right:8px;letter-spacing:1px;white-space:nowrap}
 .tagpill{display:inline-block;border:1px dashed #facc15;color:#fef08a;border-radius:6px;padding:4px 10px;font-size:13px;margin-left:8px}
 .pager{margin:18px 0 6px;display:flex;align-items:center;gap:4px;flex-wrap:wrap}
 .pgdots{color:#5f7a68;padding:0 4px}
@@ -683,7 +685,6 @@ ${empty}
 <div class="secbody" id="sec-ai"><div class="grid showcase${aiList.length > 6? " clipped": ""}" id="g-ai">${aiList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-ai", aiList.length)}</div>
 <h2 class="sechead" data-collapse="sec-security"><span>◢ 网安 · 红队 · SRC 情报 SECURITY INTEL</span><span class="ctog">▼</span></h2>
 <div class="secbody" id="sec-security">
-<h3 class="seedcat">▸ 热门标签 TAG CLOUD（点标签筛选全部情报）</h3><div class="tagcloud" id="tag-cloud">${tagCloud || '<span class="muted">暂无标签数据</span>'}</div>
 <div class="grid showcase${secList.length > 6? " clipped": ""}" id="g-sec">${secList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-sec", secList.length)}</div>
 <h2 class="sechead" data-collapse="sec-src"><span>◢ SRC · 挖洞 SRC HUNTING</span><span class="ctog">▼</span></h2>
 <div class="secbody" id="sec-src"><div class="grid showcase${srcList.length > 6? " clipped": ""}" id="g-src">${srcList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-src", srcList.length)}</div>
@@ -701,7 +702,7 @@ ${seedGroups}
 <h2 id="all-intel" class="sechead" data-collapse="sec-all"><span>◢ 全部情报 ALL INTEL</span><span class="ctog">▼</span></h2>
 <div class="secbody" id="sec-all">
 <div class="pager prominent" id="pager-top"><button class="fbtn pg-prev" type="button">← 上一页</button><span class="pg-nums">${pagerBtns}</span><button class="fbtn pg-next" type="button">下一页 →</button><span class="muted pg-status"></span></div>
-<div class="filterbar"><div>${filterBtns}</div>
+<div class="filterbar"><div class="tagrow" id="tag-cloud"><span class="taglabel">🏷 热门标签（点标签筛选）</span>${tagCloud || '<span class="muted">暂无标签数据</span>'}</div><div>${filterBtns}</div>
 <div><button class="fbtn on" data-gf="all">评级 全部</button><button class="fbtn" data-gf="S">S 级</button><button class="fbtn" data-gf="A">A 级</button><button class="fbtn" data-gf="B">B 级</button><input type="search" id="q" placeholder="🔍 搜仓库名 / 描述 / 语言"><span class="muted" id="shown"></span><span id="tag-pill" class="tagpill" style="display:none">标签：<b id="tag-name"></b> <button class="fbtn" id="tag-clear" type="button">✕ 清除标签</button></span></div><div style="margin-top:6px"><button class="fbtn" id="btn-expand-all" type="button">全部展开</button><button class="fbtn" id="btn-collapse-all" type="button">全部收起</button></div></div>
 <div class="grid" id="all-grid">${repos.map((r, i) => repoCard(r, i + 1)).join("")}</div>
 <div class="pager prominent" id="pager-bottom"><button class="fbtn pg-prev" type="button">← 上一页</button><span class="pg-nums">${pagerBtns}</span><button class="fbtn pg-next" type="button">下一页 →</button><span class="muted pg-status"></span></div>
