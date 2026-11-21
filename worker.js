@@ -1,5 +1,5 @@
 // ============================================================
-// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v3：11 通道 + 安全细粒度标签体系 + 全部情报分页）
+// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗）
 // 单文件 Cloudflare Worker：定时巡检 GitHub 热门仓库，做规则研判（热度/学习点/评级），
 // 以「黑客情报中心」风格暗色面板呈现。零依赖，数据存 KV（绑定名 INTEL_KV）。
 // 研判为规则引擎产出，非 AI 生成，面板与代码均如实标注「规则研判」。
@@ -15,6 +15,7 @@ refreshThrottleMs: 30 * 60 * 1000, // 手动刷新节流 30 分钟（省流，�
 kvLatest: "intel:latest",
 kvPrev: "intel:prev",
 kvMeta: "intel:meta",
+kvSeedIds: "intel:seedids",
 };
 
 // 日期工具：GitHub search 需要 YYYY-MM-DD
@@ -81,14 +82,17 @@ const SEEDS = [
 { repo: "CallMeGuLab/dsh-purge-safe", cat: "security", note: "数据安全清理的安全处置流程与边界"},
 ];
 
-// 把种子与巡检数据按 full_name 合并：命中则带其实时 ★/热度/增量，未命中 live=null
-function buildWatchlist(repos) {
+// 把种子与巡检数据合并：优先按仓库 id 匹配（种子 id 映射来自 KV intel:seedids，改名后仍可命中），兜底按 full_name 匹配；命中改名仓库时展示当前名与当前链接
+function buildWatchlist(repos, seedIds) {
 const byName = new Map((repos || []).map((r) => [r.full_name.toLowerCase(), r]));
+const byId = new Map((repos || []).filter((r) => r.id != null).map((r) => [String(r.id), r]));
 return SEEDS.map((s) => {
-const live = s.repo? byName.get(s.repo.toLowerCase()): undefined;
+let live;
+if (s.repo && seedIds && seedIds[s.repo] != null) live = byId.get(String(seedIds[s.repo]));
+if (!live && s.repo) live = byName.get(s.repo.toLowerCase());
 return {
-name: s.repo || s.name,
-url: s.repo? `https://github.com/${s.repo}`: s.url,
+name: live? live.full_name: (s.repo || s.name),
+url: live? live.html_url: (s.repo? `https://github.com/${s.repo}`: s.url),
 cat: s.cat,
 catName: SEED_CATS[s.cat] || s.cat,
 note: s.note,
@@ -117,9 +121,10 @@ const j = await r.json();
 return Array.isArray(j.items)? j.items: [];
 }
 
-// GitHub 原始 item -> 情报库统一记录
+// GitHub 原始 item -> 情报库统一记录（id 为 GitHub 数字仓库 ID：仓库改名/转移时不变，是监控锚点）
 function normalizeRepo(it, channelKey) {
 return {
+id: typeof it.id === "number"? it.id: null,
 full_name: it.full_name,
 html_url: it.html_url,
 description: it.description || "",
@@ -149,8 +154,20 @@ return v == null? fallback: v;
 async function runSweep(env) {
 const channels = buildChannels();
 const oldLatest = await loadJSON(env, CONFIG.kvLatest, null);
-const prev = await loadJSON(env, CONFIG.kvPrev, {}); // {full_name: stars,..., ts}
+const prev = await loadJSON(env, CONFIG.kvPrev, {}); // 新格式 {ts, byId:{id:{s,n}}}；旧格式 {full_name: stars, ts}
 const prevTs = typeof prev.ts === "number"? prev.ts: 0;
+// 快照查找表：以仓库 id 为锚（改名不丢增量）；旧格式则先建 name->stars 迁移查找，迁移轮照常算 delta
+const prevById = {};
+const prevByName = {};
+if (prev && typeof prev === "object") {
+if (prev.byId && typeof prev.byId === "object") {
+for (const [id, v] of Object.entries(prev.byId)) {
+if (v && typeof v.s === "number") { prevById[id] = v; if (v.n) prevByName[v.n] = v.s; }
+}
+} else {
+for (const [k, v] of Object.entries(prev)) if (k !== "ts" && typeof v === "number") prevByName[k] = v;
+}
+}
 
 const merged = new Map(); // full_name -> record
 const errors = {};
@@ -191,12 +208,24 @@ await env.INTEL_KV.put(CONFIG.kvMeta, JSON.stringify(meta));
 return meta;
 }
 
-// 计算 starDelta 并做研判
+// 计算 starDelta 并做研判：优先按仓库 id 对齐上轮快照；id 命中但名字不同 = 改名（保留增量并记录改名事件）
 let newCount = 0;
+const renames = [];
 const repos = [];
 for (const rec of merged.values()) {
-const prevStars = typeof prev[rec.full_name] === "number"? prev[rec.full_name]: null;
+let prevStars = null, renamedFrom = null;
+if (rec.id != null && prevById[String(rec.id)]) {
+prevStars = prevById[String(rec.id)].s;
+const oldName = prevById[String(rec.id)].n;
+if (oldName && oldName !== rec.full_name) renamedFrom = oldName;
+} else if (typeof prevByName[rec.full_name] === "number") {
+prevStars = prevByName[rec.full_name]; // 旧格式迁移轮 / 无 id 记录按名兜底
+}
 rec.starDelta = prevStars == null? null: rec.stars - prevStars;
+if (renamedFrom) {
+rec.renamedFrom = renamedFrom;
+renames.push({ from: renamedFrom, to: rec.full_name, stars: rec.stars});
+}
 if (prevStars == null) newCount++; // 不在上轮快照里 = 本轮新入情报库（首轮即全部）
 Object.assign(rec, analyze(rec));
 repos.push(rec);
@@ -205,11 +234,22 @@ repos.sort((a, b) => b.heat - a.heat);
 
 const ts = Date.now();
 const latest = { ts, repos};
-// 新快照：扁平 {full_name: stars, ts}（full_name 必含 "/"，与 ts 键不会撞）
-const newPrev = { ts};
-for (const r of repos) newPrev[r.full_name] = r.stars;
+// 新快照：按仓库 id 键 {ts, byId:{ "<id>": {s: stars, n: full_name} }}，改名/转移后仍可对齐
+const newPrev = { ts, byId: {}};
+for (const r of repos) if (r.id != null) newPrev.byId[String(r.id)] = { s: r.stars, n: r.full_name};
 
-const meta = { ts, ok: true, counts, errors, total: repos.length, newCount, channelsOk: okChannels, channelsTotal: channels.length};
+// 种子 id 映射：本轮按名或既有 id 命中种子时，把其仓库 id 记入 intel:seedids，供后续改名后仍按 id 命中
+const seedIds = (await loadJSON(env, CONFIG.kvSeedIds, {})) || {};
+const byNameNow = new Map(repos.map((r) => [r.full_name.toLowerCase(), r]));
+const byIdNow = new Map(repos.filter((r) => r.id != null).map((r) => [String(r.id), r]));
+for (const s of SEEDS) {
+if (!s.repo) continue;
+const hit = byNameNow.get(s.repo.toLowerCase()) || (seedIds[s.repo] != null? byIdNow.get(String(seedIds[s.repo])): undefined);
+if (hit && hit.id != null) seedIds[s.repo] = hit.id;
+}
+await env.INTEL_KV.put(CONFIG.kvSeedIds, JSON.stringify(seedIds));
+
+const meta = { ts, ok: true, counts, errors, total: repos.length, newCount, channelsOk: okChannels, channelsTotal: channels.length, renames};
 await env.INTEL_KV.put(CONFIG.kvLatest, JSON.stringify(latest));
 await env.INTEL_KV.put(CONFIG.kvPrev, JSON.stringify(newPrev));
 await env.INTEL_KV.put(CONFIG.kvMeta, JSON.stringify(meta));
@@ -347,6 +387,114 @@ catch { return iso;}
 }
 
 // ============================================================
+// 【核心模块】总统简报生成 — 从当前情报数据提炼「总统简报」：态势一句话、飙升/热度 TOP3、网安与 Skill 焦点、重点监控动态（规则模板产出，非 AI）
+// ============================================================
+function briefRepo(r) {
+if (!r) return null;
+return {
+name: r.full_name,
+url: r.html_url,
+stars: r.stars || 0,
+heat: r.heat || 0,
+grade: r.grade || "B",
+delta: typeof r.starDelta === "number"? r.starDelta: null,
+verdict: r.verdict || "",
+};
+}
+function secTagFreq(repos) {
+const freq = {};
+for (const r of repos) {
+if (!(r.channels || []).some((c) => ["security", "src-hunt", "sec-learning"].includes(c))) continue;
+for (const t of r.learnTags || []) freq[t] = (freq[t] || 0) + 1;
+}
+return freq;
+}
+function buildBrief(repos, meta, seedIds) {
+repos = Array.isArray(repos)? repos: [];
+const byDelta = repos.filter((r) => typeof r.starDelta === "number").sort((a, b) => b.starDelta - a.starDelta).slice(0, 3);
+const byHeat = [...repos].sort((a, b) => (b.heat || 0) - (a.heat || 0)).slice(0, 3);
+const secRepos = repos.filter((r) => (r.channels || []).some((c) => ["security", "src-hunt"].includes(c)))
+.sort((a, b) => (b.heat || 0) - (a.heat || 0));
+const topSecTags = Object.entries(secTagFreq(repos)).sort((a, b) => b[1] - a[1]).slice(0, 3)
+.map(([tag, count]) => ({ tag, count}));
+const skillTop = repos.filter((r) => (r.channels || []).includes("skills"))
+.sort((a, b) => (b.heat || 0) - (a.heat || 0))[0] || null;
+const wl = buildWatchlist(repos, seedIds);
+const liveSeeds = wl.filter((w) => w.live);
+// 改名动态：优先从仓库记录的 renamedFrom 还原，其次用巡检 meta 里记录的改名事件
+let renames = repos.filter((r) => r.renamedFrom).map((r) => ({ from: r.renamedFrom, to: r.full_name, stars: r.stars}));
+if (!renames.length && meta && Array.isArray(meta.renames)) renames = meta.renames;
+// 关键词热度：聚合本轮全部仓库的 topics（出现仓库数 + 累计星标），取前 5
+const topicAgg = {};
+for (const r of repos) for (const t of r.topics || []) {
+const e = topicAgg[t] || (topicAgg[t] = { topic: t, count: 0, stars: 0});
+e.count++; e.stars += r.stars || 0;
+}
+const topTopics = Object.values(topicAgg).sort((a, b) => b.count - a.count || b.stars - a.stars).slice(0, 5);
+const topSeed = [...liveSeeds].sort((a, b) => (b.live.stars || 0) - (a.live.stars || 0))[0] || null;
+const newCount = meta? meta.newCount || 0: 0;
+const chOk = meta && meta.channelsOk != null? meta.channelsOk: null;
+const chTotal = meta && meta.channelsTotal != null? meta.channelsTotal: buildChannels().length;
+let oneliner;
+if (!repos.length) {
+oneliner = "情报库尚无数据，执行一次巡检后生成今日态势。";
+} else {
+const p1 = `今日共监控 ${repos.length} 个仓库，本轮新增 ${newCount} 个，巡检通道 ${chOk == null? "-": chOk}/${chTotal} 正常。`;
+const p2 = byDelta.length && byDelta[0].starDelta > 0
+? `飙升最快的是 ${byDelta[0].full_name}（本轮 +${byDelta[0].starDelta}★）。`
+: byHeat.length? `热度榜首为 ${byHeat[0].full_name}（热度 ${byHeat[0].heat || 0}）。`: "";
+const p3 = secRepos.length
+? `网安焦点为 ${secRepos[0].full_name}${topSecTags.length? "，热门安全标签：" + topSecTags.map((t) => t.tag).join("、"): ""}。`: "";
+oneliner = p1 + p2 + p3;
+}
+return {
+date: fmtCST(Date.now()),
+timeCST: new Date().toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, hour: "2-digit", minute: "2-digit"}),
+totals: { repos: repos.length, newCount, channelsOk: chOk, channelsTotal: chTotal},
+topSurging: byDelta.map(briefRepo),
+topHeat: byHeat.map(briefRepo),
+securityFocus: { top: briefRepo(secRepos[0] || null), topTags: topSecTags},
+skillsFocus: briefRepo(skillTop),
+watchlistLive: {
+liveCount: liveSeeds.length,
+total: wl.length,
+top: topSeed? { name: topSeed.name, url: topSeed.url, stars: topSeed.live.stars}: null,
+},
+renames,
+topTopics,
+oneliner,
+};
+}
+async function loadBrief(env) {
+const latest = await loadJSON(env, CONFIG.kvLatest, null);
+const meta = await loadJSON(env, CONFIG.kvMeta, null);
+const seedIds = (await loadJSON(env, CONFIG.kvSeedIds, {})) || {};
+const repos = latest && Array.isArray(latest.repos)? latest.repos: [];
+return buildBrief(repos, meta, seedIds);
+}
+function briefLine(r, suffix) {
+if (!r) return `<div class="bline muted">暂无数据</div>`;
+return `<div class="bline"><a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.name)}</a> <span class="bmeta">★ ${r.stars} · 热度 ${r.heat}${suffix || ""}</span><div class="bverdict">${esc(r.verdict)}</div></div>`;
+}
+function renderBriefHtml(b) {
+const surge = b.topSurging.length? b.topSurging.map((r) => briefLine(r, typeof r.delta === "number"? ` · ${r.delta >= 0? "+": ""}${r.delta}★ 本轮`: "")).join(""): `<div class="bline muted">暂无增量数据（需两轮巡检）</div>`;
+const heat = b.topHeat.length? b.topHeat.map((r) => briefLine(r)).join(""): `<div class="bline muted">暂无数据</div>`;
+const secTop = b.securityFocus.top? briefLine(b.securityFocus.top): `<div class="bline muted">暂无网安焦点</div>`;
+const secTags = b.securityFocus.topTags.length? `<div class="bline">热门标签：${b.securityFocus.topTags.map((t) => esc(t.tag) + " ×" + t.count).join(" · ")}</div>`: "";
+const skill = b.skillsFocus? briefLine(b.skillsFocus): `<div class="bline muted">暂无 Skill 焦点</div>`;
+const wl = `<div class="bline">已命中实时数据 <b>${b.watchlistLive.liveCount}</b> / ${b.watchlistLive.total} 个种子</div>` +
+(b.watchlistLive.top? `<div class="bline">领跑种子：<a href="${esc(b.watchlistLive.top.url)}" target="_blank" rel="noopener">${esc(b.watchlistLive.top.name)}</a> <span class="bmeta">★ ${b.watchlistLive.top.stars}</span></div>`: "");
+const topicsLine = (b.topTopics && b.topTopics.length)? `<div class="bline">关键词热度：${b.topTopics.map((t) => esc(t.topic) + "（" + t.count + " 仓 · ★" + t.stars + "）").join(" · ")}</div>`: "";
+const renameHtml = (b.renames && b.renames.length)? `<h4>【改名动态】</h4>` + b.renames.map((r) => `<div class="bline">改名动态：${esc(r.from)} → <a href="https://github.com/${esc(r.to)}" target="_blank" rel="noopener">${esc(r.to)}</a> <span class="bmeta">★ ${r.stars}</span></div>`).join(""): "";
+return `<h4>【今日态势】</h4><p class="boneliner">${esc(b.oneliner)}</p>${topicsLine}
+<h4>【飙升 TOP3】</h4>${surge}
+<h4>【热度 TOP3】</h4>${heat}
+<h4>【网安焦点】</h4>${secTop}${secTags}
+<h4>【Skill 焦点】</h4>${skill}
+${renameHtml}<h4>【重点监控动态】</h4>${wl}`;
+}
+
+// ============================================================
 // 【核心模块】情报面板 — 暗色情报中心风格：跑马灯/KPI/飙升榜/专区/全部情报（可筛选可搜索）
 // ============================================================
 function repoCard(r, rank) {
@@ -385,11 +533,7 @@ const creatorList = repos.filter((r) => r.channels.includes("creator")).slice(0,
 const srcList = repos.filter((r) => r.channels.includes("src-hunt")).slice(0, 10);
 const secLearnList = repos.filter((r) => r.channels.includes("sec-learning")).slice(0, 10);
 // 热门标签云：统计安全三通道（security/src-hunt/sec-learning）仓库的标签频次，取前 15
-const tagFreq = {};
-for (const r of repos) {
-if (!(r.channels || []).some((c) => ["security", "src-hunt", "sec-learning"].includes(c))) continue;
-for (const t of r.learnTags || []) tagFreq[t] = (tagFreq[t] || 0) + 1;
-}
+const tagFreq = secTagFreq(repos);
 const tagCloud = Object.entries(tagFreq).sort((a, b) => b[1] - a[1]).slice(0, 15)
 .map(([t, n]) => `<button type="button" class="tag tagchip cloudchip" data-tag="${esc(t)}" title="按此标签筛选全部情报">${esc(t)} · ${n}</button>`).join("");
 // 全部情报分页：每页 24 条（与 DEAL HUB 约定一致），服务端先渲染初始页码按钮，筛选后由前端重算
@@ -401,7 +545,10 @@ if (totalPages <= 7) { for (let i = 1; i <= totalPages; i++) pages.push(i); }
 else pages.push(1, 2, "…", totalPages - 1, totalPages);
 return pages.map((p) => p === "…"? `<span class="pgdots">…</span>`: `<button class="fbtn pgnum${p === 1? " on": ""}" data-page="${p}">${p}</button>`).join("");
 })();
-const watchlist = buildWatchlist(repos);
+const seedIds = (await loadJSON(env, CONFIG.kvSeedIds, {})) || {};
+const watchlist = buildWatchlist(repos, seedIds);
+const brief = buildBrief(repos, meta, seedIds);
+const showMoreBtn = (gid, n) => n > 6? `<button class="btn showmore" type="button" data-showmore="${gid}" data-label="展开全部 ${n} 条 ▾">展开全部 ${n} 条 ▾</button>`: "";
 const topHeat = repos.length? Math.max(...repos.map((r) => r.heat || 0)): 0;
 const newCount = meta? meta.newCount || 0: 0;
 
@@ -480,6 +627,32 @@ input[type=search]{background:#04120a;border:1px solid #14532d;color:#c9f7d4;bor
 .empty{border:1px dashed #14532d;padding:22px;color:#a7f3d0;line-height:1.7;border-radius:6px}
 .muted{color:#5f7a68;font-size:12px;line-height:1.7}
 a{color:#67e8f9}
+h2.sechead{cursor:pointer;display:flex;justify-content:space-between;align-items:center;user-select:none}
+h2.sechead:hover{color:#a5f3fc}
+.ctog{color:#4ade80;font-size:14px;text-shadow:0 0 8px rgba(74,222,128,.6)}
+.secbody{animation:secin .25s ease}
+.secbody.hide{display:none}
+@keyframes secin{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.grid.clipped .card:nth-child(n+7){display:none}
+.showmore{margin:0 0 12px}
+.pager.prominent{border:1px solid #22c55e;background:rgba(20,83,45,.30);border-radius:6px;padding:10px 12px;box-shadow:0 0 14px rgba(74,222,128,.18)}
+#brief-fab{position:fixed;right:18px;bottom:18px;z-index:60;background:#052e16;color:#4ade80;border:1px solid #22c55e;border-radius:999px;padding:11px 18px;font-family:inherit;font-size:14px;cursor:pointer;box-shadow:0 0 16px rgba(74,222,128,.35)}
+#brief-fab:hover{background:#14532d}
+#brief-panel{position:fixed;right:18px;bottom:74px;width:380px;max-width:92vw;max-height:70vh;overflow-y:auto;z-index:61;background:rgba(6,14,10,.97);border:1px solid #22c55e;border-radius:8px;box-shadow:0 0 24px rgba(74,222,128,.35),0 0 60px rgba(103,232,249,.12);font-size:13px}
+#brief-head{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #14532d;cursor:grab;touch-action:none;color:#4ade80;font-weight:700;letter-spacing:1px;position:sticky;top:0;background:rgba(6,14,10,.97);z-index:2}
+#brief-head:active{cursor:grabbing}
+#brief-head button{background:#052e16;color:#4ade80;border:1px solid #22c55e;border-radius:4px;cursor:pointer;font-family:inherit;padding:1px 9px;margin-left:5px}
+#brief-body{padding:10px 14px}
+#brief-body h4{color:#67e8f9;margin:12px 0 6px;letter-spacing:1px;font-size:13px}
+#brief-body h4:first-child{margin-top:2px}
+.boneliner{color:#d1fae5;line-height:1.65;margin:4px 0}
+.bline{margin:6px 0;line-height:1.55;color:#d1fae5}
+.bline a{color:#4ade80;font-weight:700;text-decoration:none;word-break:break-all}
+.bline a:hover{text-decoration:underline}
+.bmeta{color:#6ee7b7;font-size:12px}
+.bverdict{color:#fef08a;font-size:12px;line-height:1.5}
+.brief-foot{padding:8px 14px;border-top:1px dashed #14532d;color:#5f7a68;font-size:12px}
+@media (max-width:520px){#brief-panel{width:92vw}}
 </style></head><body><div class="wrap">
 <div class="topbar"><div class="toprow">
 <div><h1>◢ GitHub 情报中心</h1><div class="sub">GITHUB INTEL CENTER // 开源情报巡检 · 规则研判 · 非 AI 生成</div></div>
@@ -502,26 +675,46 @@ a{color:#67e8f9}
 ${empty}
 <h2>◢ 情报总览 INTEL OVERVIEW</h2>
 <p class="muted">本面板追踪 GitHub 热门仓库：飙升榜按本轮星标增量排序（需至少两轮巡检才有增量），其余按热度分排序。热度分 = 星标规模 + 本轮增量 + 推送新鲜度 + fork 活跃度的规则加权；学习点为关键词规则映射；评级 S ≥70、A ≥45、B 其余。</p>
-<h2>◢ 飙升榜 STAR SURGE</h2><div class="grid">${surgeList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
-<h2>◢ 热门新星 NEW STARS</h2><div class="grid">${newStars.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
-<h2>◢ AI / AGENT 专区</h2><div class="grid">${aiList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
-<h2>◢ 网安 · 红队 · SRC 情报 SECURITY INTEL</h2>
+<h2 class="sechead" data-collapse="sec-surge"><span>◢ 飙升榜 STAR SURGE</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-surge"><div class="grid showcase${surgeList.length > 6? " clipped": ""}" id="g-surge">${surgeList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-surge", surgeList.length)}</div>
+<h2 class="sechead" data-collapse="sec-newstars"><span>◢ 热门新星 NEW STARS</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-newstars"><div class="grid showcase${newStars.length > 6? " clipped": ""}" id="g-newstars">${newStars.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-newstars", newStars.length)}</div>
+<h2 class="sechead" data-collapse="sec-ai"><span>◢ AI / AGENT 专区</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-ai"><div class="grid showcase${aiList.length > 6? " clipped": ""}" id="g-ai">${aiList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-ai", aiList.length)}</div>
+<h2 class="sechead" data-collapse="sec-security"><span>◢ 网安 · 红队 · SRC 情报 SECURITY INTEL</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-security">
 <h3 class="seedcat">▸ 热门标签 TAG CLOUD（点标签筛选全部情报）</h3><div class="tagcloud" id="tag-cloud">${tagCloud || '<span class="muted">暂无标签数据</span>'}</div>
-<div class="grid">${secList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
-<h2>◢ SRC · 挖洞 SRC HUNTING</h2><div class="grid">${srcList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
-<h2>◢ 网安学习资料 SECURITY LEARNING</h2><div class="grid">${secLearnList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
-<h2>◢ Skill 生态 SKILL ECOSYSTEM</h2><div class="grid">${skillList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
-<h2>◢ 自媒体全套 CREATOR TOOLKIT</h2><div class="grid">${creatorList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>
-<h2>◢ 重点监控 WATCHLIST</h2>
+<div class="grid showcase${secList.length > 6? " clipped": ""}" id="g-sec">${secList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-sec", secList.length)}</div>
+<h2 class="sechead" data-collapse="sec-src"><span>◢ SRC · 挖洞 SRC HUNTING</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-src"><div class="grid showcase${srcList.length > 6? " clipped": ""}" id="g-src">${srcList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-src", srcList.length)}</div>
+<h2 class="sechead" data-collapse="sec-seclearn"><span>◢ 网安学习资料 SECURITY LEARNING</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-seclearn"><div class="grid showcase${secLearnList.length > 6? " clipped": ""}" id="g-seclearn">${secLearnList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-seclearn", secLearnList.length)}</div>
+<h2 class="sechead" data-collapse="sec-skills"><span>◢ Skill 生态 SKILL ECOSYSTEM</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-skills"><div class="grid showcase${skillList.length > 6? " clipped": ""}" id="g-skills">${skillList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-skills", skillList.length)}</div>
+<h2 class="sechead" data-collapse="sec-creator"><span>◢ 自媒体全套 CREATOR TOOLKIT</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-creator"><div class="grid showcase${creatorList.length > 6? " clipped": ""}" id="g-creator">${creatorList.map((r, i) => repoCard(r, i + 1)).join("") || '<p class="muted">暂无数据</p>'}</div>${showMoreBtn("g-creator", creatorList.length)}</div>
+<h2 class="sechead" data-collapse="sec-watchlist"><span>◢ 重点监控 WATCHLIST</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-watchlist">
 <p class="muted">人工精选种子清单（已预筛）：Skill 生态 / 写作 / 科研 / 自媒体 / 网安五类。种子若被本轮巡检命中，卡片会带其实时 ★、热度与本轮增量；未命中则标注「点名监控中」。种子学习点为人工研判，与规则研判区分。</p>
 ${seedGroups}
-<h2 id="all-intel">◢ 全部情报 ALL INTEL</h2>
+</div>
+<h2 id="all-intel" class="sechead" data-collapse="sec-all"><span>◢ 全部情报 ALL INTEL</span><span class="ctog">▼</span></h2>
+<div class="secbody" id="sec-all">
+<div class="pager prominent" id="pager-top"><button class="fbtn pg-prev" type="button">← 上一页</button><span class="pg-nums">${pagerBtns}</span><button class="fbtn pg-next" type="button">下一页 →</button><span class="muted pg-status"></span></div>
 <div class="filterbar"><div>${filterBtns}</div>
-<div><button class="fbtn on" data-gf="all">评级 全部</button><button class="fbtn" data-gf="S">S 级</button><button class="fbtn" data-gf="A">A 级</button><button class="fbtn" data-gf="B">B 级</button><input type="search" id="q" placeholder="🔍 搜仓库名 / 描述 / 语言"><span class="muted" id="shown"></span><span id="tag-pill" class="tagpill" style="display:none">标签：<b id="tag-name"></b> <button class="fbtn" id="tag-clear" type="button">✕ 清除标签</button></span></div></div>
+<div><button class="fbtn on" data-gf="all">评级 全部</button><button class="fbtn" data-gf="S">S 级</button><button class="fbtn" data-gf="A">A 级</button><button class="fbtn" data-gf="B">B 级</button><input type="search" id="q" placeholder="🔍 搜仓库名 / 描述 / 语言"><span class="muted" id="shown"></span><span id="tag-pill" class="tagpill" style="display:none">标签：<b id="tag-name"></b> <button class="fbtn" id="tag-clear" type="button">✕ 清除标签</button></span></div><div style="margin-top:6px"><button class="fbtn" id="btn-expand-all" type="button">全部展开</button><button class="fbtn" id="btn-collapse-all" type="button">全部收起</button></div></div>
 <div class="grid" id="all-grid">${repos.map((r, i) => repoCard(r, i + 1)).join("")}</div>
-<div class="pager" id="pager"><button class="fbtn" id="pg-prev" type="button">← 上一页</button><span id="pg-nums">${pagerBtns}</span><button class="fbtn" id="pg-next" type="button">下一页 →</button><span class="muted" id="pg-status"></span></div>
+<div class="pager prominent" id="pager-bottom"><button class="fbtn pg-prev" type="button">← 上一页</button><span class="pg-nums">${pagerBtns}</span><button class="fbtn pg-next" type="button">下一页 →</button><span class="muted pg-status"></span></div>
 <p class="muted">数据源：GitHub Search API（公开接口，未认证时限额约 10 次/分钟、每小时搜索配额有限；配置 GITHUB_TOKEN 可提高）。星标增量需至少两轮巡检对比快照得出，第一轮均为「新入情报库」。本站研判均为规则引擎产出，重点监控种子的学习点为人工撰写，均不构成推荐结论。</p>
 </div>
+</div>
+<button id="brief-fab" type="button">📋 总统简报</button>
+<div id="brief-panel" style="display:none">
+<div id="brief-head"><span>📋 总统简报 · DAILY BRIEF</span><span><button id="brief-min" type="button" title="最小化">—</button><button id="brief-close" type="button" title="关闭">✕</button></span></div>
+<div id="brief-body">${renderBriefHtml(brief)}</div>
+<div class="brief-foot">生成于 ${esc(brief.timeCST)} CST · 规则引擎（非 AI 生成）</div>
+</div>
+<script type="application/json" id="brief-data">${JSON.stringify(brief).replace(/</g, "\\u003c")}</script>
 <script>
 function doRefresh(btn){
 var msg=document.querySelector(".rmsg"); if(msg) msg.textContent="巡检中…（约需数秒）";
@@ -553,16 +746,21 @@ return out;
 }
 function scrollAll(){ var el=document.getElementById("all-intel"); if(el) el.scrollIntoView({behavior:"smooth"});}
 function renderPager(total,pages){
-var nums=document.getElementById("pg-nums");
-nums.innerHTML=pageList(curPage,pages).map(function(p){
+var numsHtml=pageList(curPage,pages).map(function(p){
 return p==="…"? '<span class="pgdots">…</span>': '<button class="fbtn pgnum'+(p===curPage?" on":"")+'" data-page="'+p+'">'+p+'</button>';
 }).join("");
-document.getElementById("pg-status").textContent="第 "+curPage+" / "+pages+" 页 · 共 "+total+" 条（筛选后）";
-document.getElementById("pg-prev").disabled=curPage<=1;
-document.getElementById("pg-next").disabled=curPage>=pages;
+document.querySelectorAll(".pager").forEach(function(pg){
+var nums=pg.querySelector(".pg-nums");
+if(nums){ nums.innerHTML=numsHtml;
 nums.querySelectorAll("[data-page]").forEach(function(b){ b.addEventListener("click", function(){
 curPage=parseInt(b.dataset.page,10); applyFilter(false); scrollAll();
-});});
+});});}
+var st=pg.querySelector(".pg-status");
+if(st) st.textContent="第 "+curPage+" / "+pages+" 页 · 共 "+total+" 条（筛选后）";
+var pv=pg.querySelector(".pg-prev"), nx=pg.querySelector(".pg-next");
+if(pv) pv.disabled=curPage<=1;
+if(nx) nx.disabled=curPage>=pages;
+});
 }
 function applyFilter(reset){
 if(reset) curPage=1;
@@ -592,8 +790,49 @@ document.querySelectorAll("[data-tag]").forEach(function(ch){ ch.addEventListene
 curTag=ch.dataset.tag; applyFilter(true); scrollAll();
 });});
 document.getElementById("tag-clear").addEventListener("click", function(){ curTag=""; applyFilter(true);});
-document.getElementById("pg-prev").addEventListener("click", function(){ if(curPage>1){ curPage--; applyFilter(false); scrollAll();}});
-document.getElementById("pg-next").addEventListener("click", function(){ curPage++; applyFilter(false); scrollAll();});
+document.querySelectorAll(".pg-prev").forEach(function(b){ b.addEventListener("click", function(){ if(curPage>1){ curPage--; applyFilter(false); scrollAll(); }});});
+document.querySelectorAll(".pg-next").forEach(function(b){ b.addEventListener("click", function(){ curPage++; applyFilter(false); scrollAll(); });});
+var collapsed={};
+function setSection(id, hide){
+var body=document.getElementById(id); if(!body) return;
+body.classList.toggle("hide", hide); collapsed[id]=hide;
+var tog=document.querySelector('[data-collapse="'+id+'"] .ctog');
+if(tog) tog.textContent=hide?"▶":"▼";
+}
+document.querySelectorAll("[data-collapse]").forEach(function(h){ h.addEventListener("click", function(){
+var id=h.dataset.collapse; setSection(id, !collapsed[id]);
+});});
+var btnExp=document.getElementById("btn-expand-all"), btnCol=document.getElementById("btn-collapse-all");
+if(btnExp) btnExp.addEventListener("click", function(){ document.querySelectorAll(".secbody").forEach(function(b){ setSection(b.id, false); });});
+if(btnCol) btnCol.addEventListener("click", function(){ document.querySelectorAll(".secbody").forEach(function(b){ setSection(b.id, true); });});
+document.querySelectorAll("[data-showmore]").forEach(function(b){ b.addEventListener("click", function(){
+var g=document.getElementById(b.dataset.showmore); if(!g) return;
+var clipped=g.classList.toggle("clipped");
+b.textContent=clipped? b.dataset.label: "收起 ▴";
+});});
+var briefPanel=document.getElementById("brief-panel");
+function closeBrief(){ if(briefPanel) briefPanel.style.display="none"; }
+document.getElementById("brief-fab").addEventListener("click", function(){
+briefPanel.style.display=briefPanel.style.display==="block"? "none": "block";
+});
+document.getElementById("brief-close").addEventListener("click", closeBrief);
+document.getElementById("brief-min").addEventListener("click", closeBrief);
+document.addEventListener("keydown", function(e){ if(e.key==="Escape") closeBrief(); });
+document.getElementById("brief-head").addEventListener("pointerdown", function(e){
+if(e.target.closest("button")) return;
+var r=briefPanel.getBoundingClientRect();
+var dx=e.clientX-r.left, dy=e.clientY-r.top;
+briefPanel.style.left=r.left+"px"; briefPanel.style.top=r.top+"px";
+briefPanel.style.right="auto"; briefPanel.style.bottom="auto";
+function mv(ev){
+var x=Math.min(Math.max(0, ev.clientX-dx), window.innerWidth-r.width);
+var y=Math.min(Math.max(0, ev.clientY-dy), window.innerHeight-r.height);
+briefPanel.style.left=x+"px"; briefPanel.style.top=y+"px";
+}
+function up(){ document.removeEventListener("pointermove", mv); document.removeEventListener("pointerup", up); }
+document.addEventListener("pointermove", mv);
+document.addEventListener("pointerup", up);
+});
 applyFilter(false);
 </script>
 </body></html>`;
@@ -621,11 +860,14 @@ if (url.pathname === "/" && request.method === "GET") return renderPanel(env);
 if (url.pathname === "/api/repos" && request.method === "GET") {
 const latest = await loadJSON(env, CONFIG.kvLatest, { ts: 0, repos: []});
 const repos = latest.repos || [];
-return Response.json({ ok: true, ts: latest.ts || 0, count: repos.length, repos, watchlist: buildWatchlist(repos)});
+return Response.json({ ok: true, ts: latest.ts || 0, count: repos.length, repos, watchlist: buildWatchlist(repos, (await loadJSON(env, CONFIG.kvSeedIds, {})) || {})});
+}
+if (url.pathname === "/api/brief" && request.method === "GET") {
+return Response.json({ ok: true, brief: await loadBrief(env)});
 }
 if (url.pathname === "/api/watchlist" && request.method === "GET") {
 const latest = await loadJSON(env, CONFIG.kvLatest, { ts: 0, repos: []});
-const watchlist = buildWatchlist(latest.repos || []);
+const watchlist = buildWatchlist(latest.repos || [], (await loadJSON(env, CONFIG.kvSeedIds, {})) || {});
 return Response.json({ ok: true, count: watchlist.length, watchlist});
 }
 if (url.pathname === "/api/stats" && request.method === "GET") {
