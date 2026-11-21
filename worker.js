@@ -767,6 +767,9 @@ h2{color:#67e8f9;letter-spacing:2px;font-size:18px;text-shadow:0 0 10px rgba(103
 .card:hover{border-color:#22c55e;box-shadow:0 0 18px rgba(74,222,128,.28),0 0 42px rgba(103,232,249,.10);transform:translateY(-2px)}
 .rank{color:#0a0e12;background:#4ade80;border-radius:4px;font-weight:700;padding:0 6px;margin-right:7px;font-size:12px}
 .stickyhead{position:sticky;top:0;z-index:50;background:rgba(10,14,18,.97);backdrop-filter:blur(7px);border-bottom:1px solid #14532d;padding:10px 0 12px;margin-bottom:6px}
+.stickyhead.collapsed{padding-bottom:6px}
+.stickyhead.collapsed .tagrow,.stickyhead.collapsed .filterbar{display:none}
+#head-toggle{margin-top:6px}
 .topbar{padding-bottom:2px}
 .toprow{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap}
 .clockbox{text-align:right;color:#67e8f9;font-size:13px;line-height:1.6}
@@ -833,7 +836,7 @@ h2.sechead:hover{color:#a5f3fc}
 <div class="stickyhead">
 <div class="topbar"><div class="toprow">
 <div><h1>◢ GitHub 情报中心</h1><div class="sub">GITHUB INTEL CENTER // 开源情报巡检 · 规则研判 · 非 AI 生成</div></div>
-<div class="clockbox"><div>北京时间 CST <b id="clock">--:--:--</b></div><div>巡检状态：${meta? (meta.ok? "✅ 正常": "⚠️ 异常") + " · " + esc(fmtCST(meta.ts)): "尚无数据"} · 通道 ${meta? (meta.channelsOk?? "-"): "-"}/${channels.length}</div></div>
+<div class="clockbox"><div>北京时间 CST <b id="clock">--:--:--</b></div><div>巡检状态：${meta? (meta.ok? "✅ 正常": "⚠️ 异常") + " · " + esc(fmtCST(meta.ts)): "尚无数据"} · 通道 ${meta? (meta.channelsOk?? "-"): "-"}/${channels.length}</div><button class="fbtn" id="head-toggle" type="button">收起工具栏 ▴</button></div>
 </div></div>
 <div class="tagrow" id="tag-cloud"><span class="taglabel">🏷 热门标签（点标签筛选全部情报）</span>${tagCloud || '<span class="muted">暂无标签数据</span>'}</div>
 <div class="filterbar"><div>${filterBtns}</div>
@@ -981,6 +984,10 @@ if(tog) tog.textContent=hide?"▶":"▼";
 document.querySelectorAll("[data-collapse]").forEach(function(h){ h.addEventListener("click", function(){
 var id=h.dataset.collapse; setSection(id, !collapsed[id]);
 });});
+var headTgl=document.getElementById("head-toggle"), stickyHead=document.querySelector(".stickyhead");
+function setHeadCollapsed(c){ if(!stickyHead) return; stickyHead.classList.toggle("collapsed", !!c); if(headTgl) headTgl.textContent=c? "展开工具栏 ▾": "收起工具栏 ▴"; try{ localStorage.setItem("ih-head", c? "1": "0"); }catch(e){} }
+if(headTgl) headTgl.addEventListener("click", function(){ setHeadCollapsed(!stickyHead.classList.contains("collapsed")); });
+try{ if(localStorage.getItem("ih-head")==="1") setHeadCollapsed(true); }catch(e){}
 var btnExp=document.getElementById("btn-expand-all"), btnCol=document.getElementById("btn-collapse-all");
 if(btnExp) btnExp.addEventListener("click", function(){ document.querySelectorAll(".secbody").forEach(function(b){ setSection(b.id, false); });});
 if(btnCol) btnCol.addEventListener("click", function(){ document.querySelectorAll(".secbody").forEach(function(b){ setSection(b.id, true); });});
