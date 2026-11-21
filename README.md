@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/banner.jpg" alt="GitHub 情报中心 · GITHUB INTEL CENTER" width="100%">
+
 # ◢ GitHub 情报中心
 
 **GITHUB INTEL CENTER**
@@ -11,7 +13,7 @@
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-f38020?style=for-the-badge)](https://workers.cloudflare.com)
 [![单文件零依赖](https://img.shields.io/badge/单文件-零依赖-a855f7?style=for-the-badge)](#功能)
 
-[在线面板](https://github-intel-hub.u20261103.workers.dev) · [最新 Release](https://github.com/u20260317/github-intel-hub/releases) · [功能](#功能) · [Bot 命令](#bot-命令v52) · [部署](#部署)
+[在线面板](https://github-intel-hub.u20261103.workers.dev) · [最新 Release](https://github.com/u20260317/github-intel-hub/releases) · [功能](#功能) · [Bot 命令](#bot-命令v52) · [部署](#部署) · [文档](docs/README.md)
 
 </div>
 
@@ -90,6 +92,10 @@
 - 快照 `intel:prev` 改为 id 键格式 `{ts, byId: { "<id>": {s: 星标数, n: 当时全名} }}`。旧的扁平 `{full_name: stars}` 格式会被自动迁移：迁移轮先用旧快照按名建查找表照常算增量，巡检结束即写回新格式。
 - 按 id 对齐算增量时，若 id 相同但全名变了，判定为**改名**：增量保留，记录上带 `renamedFrom`，巡检元信息 `meta.renames` 里记一条 `{from, to, stars}`，并出现在总统简报的【改名动态】里。
 - 重点监控种子另存一份 id 映射（KV `intel:seedids`，`{种子全名: id}`，每轮巡检按名或既有 id 命中时更新）：种子改名后下一轮仍按 id 命中，面板上显示的是它的**当前**全名与链接。
+
+## 文档
+
+全套手册在 [docs/](docs/README.md)：[部署手册](docs/DEPLOY.md)（从零部署/密钥/webhook/排障）· [设计文档](docs/DESIGN.md)（架构/KV 键目录/研判公式/推送状态机）· [接口手册](docs/API.md) · [Bot 手册](docs/BOT.md) · [更新日志](docs/CHANGELOG.md)。
 
 ## 部署步骤
 
