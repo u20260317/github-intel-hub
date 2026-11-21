@@ -45,6 +45,28 @@
 - **通道失败重试**：任一通道搜索报错（如未认证限额 403）时，间隔 2 秒自动重试一次再判定失败，重试过的通道记入巡检元信息 `meta.retriedChannels`；种子保鲜数记入 `meta.seedRefreshed`。
 - **全局吸顶栈**：标题栏、热门标签行与筛选条（通道/评级/搜索/展开收起）已合并为一个吸顶栈（实心背景），从页面任何滚动位置都能直接筛选，不再只在「全部情报」区内可用；「全部情报」区内只保留上下两套分页控件。
 
+## Bot 命令（v5.2）
+
+简报 Bot（与每日推送同一个 Bot）支持只读命令：在 Telegram 里给 Bot 发命令即可，数据与面板同源（同一批 KV），**全部只读，不做任何管理动作**（不能触发巡检、不能改配置）。
+
+| 命令 | 说明 |
+|---|---|
+| `/brief` | 今日总统简报（与每日推送同一份文本） |
+| `/surge` | 飙升榜 TOP5（本轮星标增量） |
+| `/hot` | 热度榜 TOP5 |
+| `/sec` | 网安焦点（安全家族 TOP5 + 热门安全标签） |
+| `/watchlist` | 重点监控状态（种子总数、巡检/保鲜/静态覆盖、星标 TOP5、疑似删库与改名提示） |
+| `/stats` | 巡检状态（上次巡检时间、通道、本轮新增、种子保鲜数、推送配置与最近推送日期） |
+| `/panel` | 情报面板与简报 JSON 链接 |
+| `/help`（或 `/start`） | 命令列表 |
+
+开通步骤（在 v5 推送配置的基础上多三步）：
+
+1. 给 Worker 加 Secret `TG_WEBHOOK_SECRET`：自己生成一段随机字符串。不加这个 Secret 时 `POST /tg/webhook` 直接返回 404，命令系统等于关闭；加了之后，请求头 `x-telegram-bot-api-secret-token` 与它不一致的请求一律 403。
+2. 注册 Webhook（把 `<TOKEN>`、`<SECRET>` 与域名换成自己的）：
+   `curl "https://api.telegram.org/bot<TOKEN>/setWebhook" -d "url=https://<你的地址>/tg/webhook" -d "secret_token=<SECRET>"`
+3. 注册命令菜单：先取清单 `curl https://<你的地址>/api/tg/commands`，把返回的 `commands` 数组作为 `commands` 参数调 `setMyCommands`，用户在输入框打 `/` 时就能看到命令菜单。
+
 ## 监控锚点：仓库 id（v4）
 
 仓库会被改名或转移所有者，`full_name` 不是稳定锚点。v4 起每条记录都存 GitHub 数字仓库 `id`（Search API 原样返回），并以它为准对齐：
@@ -60,7 +82,7 @@
 3. 给 Worker 绑 KV：变量名必须为 **`INTEL_KV`**，指向第 1 步的 namespace。
 4. （可选）加 Cron 触发器，推荐 `17 */6 * * *`（每 6 小时巡检一次；未认证 GitHub 限额低，别太勤）。
 5. （可选）加 Secret `GITHUB_TOKEN`：填一个 GitHub Personal Access Token（只读公开数据即可）可大幅提高 API 限额；不填也能跑。
-6. （可选）总统简报 Telegram 推送：加 Secret `TG_BOT_TOKEN`（BotFather 给的 token），再加 `TG_CHAT_ID`（你的私聊 id）和/或 `TG_CHANNEL_ID`（频道 `@用户名` 或 `-100…` 数字 id）任意一个或两个。推频道时 Bot 必须是该频道管理员。都不加则不推送。
+6. （可选）总统简报 Telegram 推送：加 Secret `TG_BOT_TOKEN`（BotFather 给的 token），再加 `TG_CHAT_ID`（你的私聊 id）和/或 `TG_CHANNEL_ID`（频道 `@用户名` 或 `-100…` 数字 id）任意一个或两个。推频道时 Bot 必须是该频道管理员。都不加则不推送。若还要开通 Bot 命令，再加 Secret `TG_WEBHOOK_SECRET` 并按「Bot 命令（v5.2）」一节注册 Webhook 与命令菜单。
 7. 打开 Worker 地址，点「立即巡检」拉第一批数据；或 `curl -X POST https://<你的地址>/api/refresh`。
 
 ## 接口
@@ -73,6 +95,8 @@
 | `GET /api/stats` | 最近一轮巡检元信息（时间、各通道条数、错误、改名事件 `renames`） |
 | `GET /api/brief` | 总统简报 JSON（与面板悬浮窗同一份数据：态势、飙升/热度 TOP3、网安/Skill 焦点、改名动态、关键词热度、话题趋势、重点监控动态），并附 `brief.push` 推送状态（两个 TG 目标的配置与今日结果） |
 | `POST /api/brief/push` | 手动推送总统简报到全部已配置 TG 目标（私聊 + 频道），6 小时节流；未配置返回 `status: "not_configured"` |
+| `GET /api/tg/commands` | Bot 命令清单 JSON（`setMyCommands` 用，8 条） |
+| `POST /tg/webhook` | Telegram Webhook 入口（Bot 只读命令；需 Secret `TG_WEBHOOK_SECRET`，未配置返回 404、错密钥 403） |
 | `POST /api/refresh` | 手动触发巡检，30 分钟内重复调用会被节流（返回 `throttled: true`） |
 | Cron `scheduled()` | 定时巡检，不走手动节流 |
 
