@@ -17,6 +17,8 @@
 
 </div>
 
+<p align="center"><strong>中文</strong> · <a href="README.en.md">English</a> · <a href="README.ru.md">Русский</a> · <a href="README.uk.md">Українська</a> · <a href="README.ja.md">日本語</a> · <a href="README.ko.md">한국어</a> · <a href="README.es.md">Español</a> · <a href="README.ar.md">العربية</a></p>
+
 一个跑在 Cloudflare Workers 上的「黑客情报中心」风格面板：定时巡检 GitHub 热门仓库，用**规则引擎**（不是 AI）做热度研判和学习点标注，告诉你最近哪些开源项目在飙升、各自值得学什么。每天早上的「总统简报」自动推送到 Telegram 私聊与频道（频道加 Bot 为管理员即自动识别，免配置）。
 
 单文件 `worker.js`，零依赖，数据存 KV。深色面板：近黑底 + 霓虹绿/青 + 等宽字体 + 扫描线纹理 + 跑马灯。
