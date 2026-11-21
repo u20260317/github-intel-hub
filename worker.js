@@ -1,5 +1,5 @@
 // ============================================================
-// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试）
+// GitHub 情报中心 · GitHub Intel Center（原名情报局，Worker 名/网址不变；v4：分区折叠/展开全部 + 双分页 + 可拖动总统简报悬浮窗；v5：种子保鲜轮换 + 话题趋势历史 + 总统简报 Telegram 每日推送 + 通道失败重试；v5.2：Telegram Bot 命令系统）
 // 单文件 Cloudflare Worker：定时巡检 GitHub 热门仓库，做规则研判（热度/学习点/评级），
 // 以「黑客情报中心」风格暗色面板呈现。零依赖，数据存 KV（绑定名 INTEL_KV）。
 // 研判为规则引擎产出，非 AI 生成，面板与代码均如实标注「规则研判」。
@@ -1145,7 +1145,145 @@ return { pushed: Object.values(results).some(Boolean), results};
 }
 
 // ============================================================
-// 【核心模块】路由入口 — 面板、JSON 接口、手动刷新（节流）、Cron 巡检
+// 【核心模块】Telegram 命令系统 — 简报 Bot 的只读命令：POST /tg/webhook 接收 Telegram 更新，
+// 先校验请求头 x-telegram-bot-api-secret-token 与 Secret TG_WEBHOOK_SECRET 一致（未配置该 Secret 时接口直接 404，错密钥 403）；
+// 只处理 message 里的 /命令，其余更新一律 200 忽略。回复数据与面板同源（同一批 KV），全部只读，不做任何管理动作。
+// 命令清单见 TG_COMMANDS，同时通过 GET /api/tg/commands 暴露，供部署时 setMyCommands 直接取用。
+// ============================================================
+const TG_COMMANDS = [
+{ command: "brief", description: "今日总统简报"},
+{ command: "surge", description: "飙升榜 TOP5"},
+{ command: "hot", description: "热度榜 TOP5"},
+{ command: "sec", description: "网安焦点"},
+{ command: "watchlist", description: "重点监控状态"},
+{ command: "stats", description: "巡检状态"},
+{ command: "panel", description: "打开情报面板"},
+{ command: "help", description: "命令列表"},
+];
+const TG_NO_DATA = "暂无数据，等待首轮巡检。";
+
+// 命令回复共用的数据装载：最新仓库、巡检元信息与种子两份 KV（与面板同源）
+async function loadIntelData(env) {
+const latest = await loadJSON(env, CONFIG.kvLatest, null);
+const meta = await loadJSON(env, CONFIG.kvMeta, null);
+const seedIds = (await loadJSON(env, CONFIG.kvSeedIds, {})) || {};
+const seedLive = (await loadJSON(env, CONFIG.kvSeedLive, {})) || {};
+return { repos: latest && Array.isArray(latest.repos)? latest.repos: [], meta, seedIds, seedLive};
+}
+function tgRepoLink(r) {
+return `<a href="${tgEsc(r.html_url)}">${tgEsc(r.full_name)}</a>`;
+}
+function tgHelpText() {
+const lines = [
+"👋 <b>GitHub 情报中心 · 情报机器人</b>",
+"开源情报巡检 · 规则研判 · 非 AI 生成",
+"",
+"<b>可用命令</b>",
+...TG_COMMANDS.map((c) => `/${c.command} — ${c.description}`),
+"",
+`<a href="${CONFIG.panelUrl}">打开情报面板 →</a>`,
+];
+return lines.join("\n");
+}
+// 按命令生成回复文本（HTML 解析模式）；无数据时统一回 TG_NO_DATA 或说明性文字，不抛错
+async function tgCommandReply(env, cmd) {
+switch (cmd) {
+case "start":
+case "help":
+return tgHelpText();
+case "panel":
+return [
+"🖥 <b>GitHub 情报中心</b>",
+`情报面板：<a href="${CONFIG.panelUrl}">${tgEsc(CONFIG.panelUrl)}</a>`,
+`简报 JSON：<a href="${CONFIG.panelUrl}/api/brief">${tgEsc(CONFIG.panelUrl)}/api/brief</a>`,
+].join("\n");
+case "brief": {
+const { repos } = await loadIntelData(env);
+if (!repos.length) return TG_NO_DATA;
+return buildBriefText(await loadBrief(env)); // 与每日推送共用同一份简报文案
+}
+case "surge": {
+const { repos } = await loadIntelData(env);
+if (!repos.length) return TG_NO_DATA;
+const top = repos.filter((r) => typeof r.starDelta === "number").sort((a, b) => b.starDelta - a.starDelta).slice(0, 5);
+if (!top.length) return "📈 <b>飙升榜 TOP5</b>\n暂无增量数据（需至少两轮巡检对比）。";
+return ["📈 <b>飙升榜 TOP5</b>", ...top.map((r, i) => `${i + 1}. ${tgRepoLink(r)} ★${r.stars}（${r.starDelta >= 0? "+": ""}${r.starDelta}★ 本轮）`)].join("\n");
+}
+case "hot": {
+const { repos } = await loadIntelData(env);
+if (!repos.length) return TG_NO_DATA;
+const top = [...repos].sort((a, b) => (b.heat || 0) - (a.heat || 0)).slice(0, 5);
+return ["🔥 <b>热度榜 TOP5</b>", ...top.map((r, i) => `${i + 1}. ${tgRepoLink(r)} ★${r.stars} · 热度 ${r.heat || 0}`)].join("\n");
+}
+case "sec": {
+const { repos } = await loadIntelData(env);
+if (!repos.length) return TG_NO_DATA;
+const fam = ["security", "src-hunt", "sec-learning"];
+const top = repos.filter((r) => (r.channels || []).some((c) => fam.includes(c))).sort((a, b) => (b.heat || 0) - (a.heat || 0)).slice(0, 5);
+const tags = Object.entries(secTagFreq(repos)).sort((a, b) => b[1] - a[1]).slice(0, 5);
+const lines = ["🛡 <b>网安焦点</b>"];
+if (top.length) top.forEach((r, i) => lines.push(`${i + 1}. ${tgRepoLink(r)} ★${r.stars} · 热度 ${r.heat || 0}`));
+else lines.push("暂无网安通道数据");
+if (tags.length) lines.push(`热门标签：${tags.map(([t, n]) => tgEsc(t) + " ×" + n).join(" · ")}`);
+return lines.join("\n");
+}
+case "watchlist": {
+const { repos, seedIds, seedLive } = await loadIntelData(env);
+const wl = buildWatchlist(repos, seedIds, seedLive);
+const liveN = wl.filter((w) => w.live).length;
+const freshN = wl.filter((w) => w.refreshed).length;
+const gone = wl.filter((w) => w.gone);
+const renamed = wl.filter((w) => w.renamedFrom);
+const scored = wl
+.map((w) => ({ w, stars: w.live? w.live.stars: w.refreshed? w.refreshed.stars: null, src: w.live? "巡检": w.refreshed? "保鲜": "静态"}))
+.filter((x) => x.stars != null).sort((a, b) => b.stars - a.stars).slice(0, 5);
+const lines = [
+`🎯 <b>重点监控</b>（共 ${wl.length} 个种子）`,
+`数据覆盖：巡检命中 ${liveN} · 单独保鲜 ${freshN} · 静态 ${wl.length - liveN - freshN - gone.length}${gone.length? ` · 疑似删库 ${gone.length}`: ""}`,
+];
+if (scored.length) {
+lines.push("星标 TOP5：");
+scored.forEach((x, i) => lines.push(`${i + 1}. <a href="${tgEsc(x.w.url)}">${tgEsc(x.w.name)}</a> ★${x.stars}（${x.src}）`));
+}
+for (const g of gone.slice(0, 5)) lines.push(`⚠️ 疑似删库/改名未追踪：${tgEsc(g.name)}`);
+for (const r of renamed.slice(0, 5)) lines.push(`🔀 改名：${tgEsc(r.renamedFrom)} → <a href="${tgEsc(r.url)}">${tgEsc(r.name)}</a>`);
+return lines.join("\n");
+}
+case "stats": {
+const { repos, meta } = await loadIntelData(env);
+if (!meta) return "📊 <b>巡检状态</b>\n尚无巡检记录，等待首轮巡检。";
+const bp = (await loadJSON(env, CONFIG.kvBriefPush, {})) || {};
+const errCh = Object.keys(meta.errors || {});
+return [
+"📊 <b>巡检状态</b>",
+`上次巡检：${fmtCST(meta.ts)}`,
+`通道：${meta.channelsOk?? "-"}/${meta.channelsTotal?? "-"} 正常${errCh.length? "（异常：" + errCh.join("、") + "）": ""}`,
+`监控仓库：${meta.total?? repos.length} 个 · 本轮新增 ${meta.newCount || 0} 个`,
+`种子保鲜：本轮单独保鲜 ${meta.seedRefreshed || 0} 个`,
+`简报推送：私聊 ${env.TG_BOT_TOKEN && env.TG_CHAT_ID? "已配置": "未配置"} · 频道 ${env.TG_BOT_TOKEN && env.TG_CHANNEL_ID? "已配置": "未配置"} · 最近推送日期 ${bp.date || "无"}`,
+].join("\n");
+}
+default:
+return tgHelpText();
+}
+}
+// Webhook 入口：校验密钥 → 只认 message 里的命令 → 回复发回消息所在的 chat（私聊即用户、群里即群）；回复发送失败不影响给 Telegram 回 200
+async function handleTgWebhook(request, env) {
+if (!env.TG_WEBHOOK_SECRET) return new Response("not found", { status: 404});
+if (request.headers.get("x-telegram-bot-api-secret-token") !== env.TG_WEBHOOK_SECRET) return new Response("forbidden", { status: 403});
+let update = null;
+try { update = await request.json(); } catch { return new Response("ok"); }
+const msg = update && update.message;
+const text = msg && typeof msg.text === "string"? msg.text.trim(): "";
+if (!msg || !text.startsWith("/") || !msg.chat || msg.chat.id == null) return new Response("ok");
+const cmd = text.split(/\s+/)[0].slice(1).split("@")[0].toLowerCase();
+const reply = await tgCommandReply(env, cmd);
+if (reply && env.TG_BOT_TOKEN) await sendTelegramTo(env, msg.chat.id, reply);
+return new Response("ok");
+}
+
+// ============================================================
+// 【核心模块】路由入口 — 面板、JSON 接口、TG 命令 Webhook、手动刷新（节流）、Cron 巡检
 // ============================================================
 export default {
 async fetch(request, env) {
@@ -1197,6 +1335,10 @@ if (url.pathname === "/api/stats" && request.method === "GET") {
 const meta = await loadJSON(env, CONFIG.kvMeta, null);
 return Response.json({ ok: true, meta});
 }
+if (url.pathname === "/api/tg/commands" && request.method === "GET") {
+return Response.json({ ok: true, commands: TG_COMMANDS});
+}
+if (url.pathname === "/tg/webhook" && request.method === "POST") return handleTgWebhook(request, env);
 if (url.pathname === "/api/refresh" && request.method === "POST") {
 const meta = await loadJSON(env, CONFIG.kvMeta, null);
 if (meta && meta.ts && Date.now() - meta.ts < CONFIG.refreshThrottleMs) {
