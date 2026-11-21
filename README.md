@@ -41,7 +41,8 @@
 
 - **种子保鲜轮换**：每轮巡检在 11 次搜索之外，最多再花 3 次核心 Repos API 调用，专门保鲜「未被本轮巡检命中」的种子。游标存 KV `intel:seedcursor`，按种子清单顺序轮换（跳过已命中的），几轮就能把全部未命中种子轮一遍。保鲜结果存 `intel:seedlive`：当前全名/★/fork/推送时间 + 保鲜时间戳；种子卡的数据新鲜度分三级——本轮巡检实时命中 → 单独保鲜（卡片带「单独保鲜」标记与时间）→ 静态点名。保鲜走 `GET /repos/{owner}/{repo}`，改名仓库会被重定向到新地址，响应即当前身份：面板显示当前名并标注「原 X 已改名」，同时把当前 id 回写 `intel:seedids`；返回 404 的种子标注「疑似删库/改名未追踪」。一轮巡检 GitHub 调用上限 = 11 搜索 + 3 保鲜 = 14 次。
 - **话题趋势历史**：每轮巡检把全部仓库的 topics 聚合（每话题：仓库数 + 累计星标，只留累计星标前 40）追加进 KV `intel:topichist`，只保留最近 56 个快照（6 小时一轮 ≈ 14 天）。趋势口径：与约 24 小时前最接近的历史快照比星标/仓库数增量，并计算「连续升温轮数」（从最新快照往回、累计星标连续严格递增的轮数）。24h 星标增量为正的前 5 个话题进总统简报的【话题趋势】，面板总览区标签云下方也有一行同样口径的话题趋势。历史不足两轮时自动隐藏。
-- **总统简报 Telegram 每日推送**：配置 Secret 后，Cron 巡检成功且北京时间已过 08:00 时，把总统简报（与 Web 版同结构：今日态势/飙升 TOP3/热度 TOP3/网安焦点/话题趋势/改名动态 + 面板链接，HTML 格式、约 1800 字内）推送到 Telegram。推送目标有两个，可同时配：`TG_CHAT_ID`（Bot 私聊）和 `TG_CHANNEL_ID`（频道，可填 `@频道名` 或 `-100…` 数字 id），外加共用的 `TG_BOT_TOKEN`；都没配则功能静默关闭。**注意：往频道推送时，Bot 必须是该频道的管理员，否则 Telegram 会拒绝发帖。** 每日一次门禁按目标分别判定，状态存 `intel:briefpush`（`{date, dm:{ok,ts}, channel:{ok,ts}}`）：某个目标失败可在当天后续巡检自动重试，已成功的目标当天不重发。手动触发：`POST /api/brief/push` 一次推全部已配置目标，自身有 6 小时节流（KV `intel:pushmanual`）；`GET /api/brief` 的 `brief.push` 字段会回报两个目标的配置状态与今日推送结果。
+- **总统简报 Telegram 每日推送**：配置 Secret 后，Cron 巡检成功且北京时间已过 08:00 时，把总统简报（与 Web 版同结构：今日态势/飙升 TOP3/热度 TOP3/网安焦点/话题趋势/改名动态 + 面板链接，HTML 格式、约 1800 字内）推送到 Telegram。推送目标可同时存在多个：`TG_CHAT_ID`（Bot 私聊）、`TG_CHANNEL_ID`（手动指定的频道，可填 `@频道名` 或 `-100…` 数字 id，v5.3 起只是可选覆盖），外加 v5.3 自动注册的全部频道（见下一条），共用 `TG_BOT_TOKEN`；一个目标都没有则功能静默关闭。**注意：往频道推送时，Bot 必须是该频道的管理员，否则 Telegram 会拒绝发帖。** 每日一次门禁按目标分别判定，状态存 `intel:briefpush`（v5.3 起为 `{date, targets: {"dm"|"ch:<chatId>": {ok,ts}}}`；v5.2 及更早的 `{date, dm, channel}` 旧格式会在读取时自动迁移，迁移来的成功记录照常门禁当天目标）：某个目标失败可在当天后续巡检自动重试，已成功的目标当天不重发。手动触发：`POST /api/brief/push` 一次推全部目标（私聊 + 手动频道 + 自动注册频道），自身有 6 小时节流（KV `intel:pushmanual`）；`GET /api/brief` 的 `brief.push` 字段回报配置状态（`configured: {dm, manualChannel, autoChannels}`，只给计数、不含频道标题与完整 id）与今日各目标推送结果。
+- **频道自动注册（v5.3）**：不用再手动查频道 id 填 `TG_CHANNEL_ID`。把简报 Bot 设为任意频道的**管理员**后，Telegram 会给 Webhook 发 `my_chat_member` 更新，Worker 据此把频道登记进 KV `intel:tgchannels`（`{ "<chatId>": {title, username, type, status, addedTs, updatedTs} }`），自动成为每日简报与手动推送的目标；Bot 被降级为普通成员、被移出或踢出时，该频道被标记 `removed` 并停止推送。v5.3 之前就已是管理员的频道没有这条事件，靠它在频道里的**第一条新帖**（`channel_post` 更新）补登记。`TG_CHANNEL_ID` 仍可作为手动覆盖与自动注册并存，按 chat id 去重只发一条。`/stats` 命令里自动注册频道的**标题只对机主可见**（发令 chat 即 `TG_CHAT_ID` 本人时），其他人只看到数量。
 - **通道失败重试**：任一通道搜索报错（如未认证限额 403）时，间隔 2 秒自动重试一次再判定失败，重试过的通道记入巡检元信息 `meta.retriedChannels`；种子保鲜数记入 `meta.seedRefreshed`。
 - **全局吸顶栈**：标题栏、热门标签行与筛选条（通道/评级/搜索/展开收起）已合并为一个吸顶栈（实心背景），从页面任何滚动位置都能直接筛选，不再只在「全部情报」区内可用；「全部情报」区内只保留上下两套分页控件。
 
@@ -63,8 +64,8 @@
 开通步骤（在 v5 推送配置的基础上多三步）：
 
 1. 给 Worker 加 Secret `TG_WEBHOOK_SECRET`：自己生成一段随机字符串。不加这个 Secret 时 `POST /tg/webhook` 直接返回 404，命令系统等于关闭；加了之后，请求头 `x-telegram-bot-api-secret-token` 与它不一致的请求一律 403。
-2. 注册 Webhook（把 `<TOKEN>`、`<SECRET>` 与域名换成自己的）：
-   `curl "https://api.telegram.org/bot<TOKEN>/setWebhook" -d "url=https://<你的地址>/tg/webhook" -d "secret_token=<SECRET>"`
+2. 注册 Webhook（把 `<TOKEN>`、`<SECRET>` 与域名换成自己的）。**`allowed_updates` 必须包含 `message`、`my_chat_member`、`channel_post` 三类**：第一类是命令，后两类是 v5.3 频道自动注册的来源（Bot 被设为频道管理员、或在已注册频道出现新帖时登记频道）；漏掉后两类，命令照常工作，但频道不会自动注册：
+   `curl "https://api.telegram.org/bot<TOKEN>/setWebhook" -d "url=https://<你的地址>/tg/webhook" -d "secret_token=<SECRET>" -d "allowed_updates=[\"message\",\"my_chat_member\",\"channel_post\"]"`
 3. 注册命令菜单：先取清单 `curl https://<你的地址>/api/tg/commands`，把返回的 `commands` 数组作为 `commands` 参数调 `setMyCommands`，用户在输入框打 `/` 时就能看到命令菜单。
 
 ## 监控锚点：仓库 id（v4）
@@ -82,7 +83,7 @@
 3. 给 Worker 绑 KV：变量名必须为 **`INTEL_KV`**，指向第 1 步的 namespace。
 4. （可选）加 Cron 触发器，推荐 `17 */6 * * *`（每 6 小时巡检一次；未认证 GitHub 限额低，别太勤）。
 5. （可选）加 Secret `GITHUB_TOKEN`：填一个 GitHub Personal Access Token（只读公开数据即可）可大幅提高 API 限额；不填也能跑。
-6. （可选）总统简报 Telegram 推送：加 Secret `TG_BOT_TOKEN`（BotFather 给的 token），再加 `TG_CHAT_ID`（你的私聊 id）和/或 `TG_CHANNEL_ID`（频道 `@用户名` 或 `-100…` 数字 id）任意一个或两个。推频道时 Bot 必须是该频道管理员。都不加则不推送。若还要开通 Bot 命令，再加 Secret `TG_WEBHOOK_SECRET` 并按「Bot 命令（v5.2）」一节注册 Webhook 与命令菜单。
+6. （可选）总统简报 Telegram 推送：加 Secret `TG_BOT_TOKEN`（BotFather 给的 token），再加 `TG_CHAT_ID`（你的私聊 id）；频道目标不用手动配 id——按「Bot 命令（v5.2）」一节开通 Webhook（含 `my_chat_member`/`channel_post`）后，把 Bot 设为频道管理员即自动注册（v5.3），`TG_CHANNEL_ID`（频道 `@用户名` 或 `-100…` 数字 id）只作可选手动覆盖。推频道时 Bot 必须是该频道管理员。都不加则不推送。若还要开通 Bot 命令，再加 Secret `TG_WEBHOOK_SECRET` 并按「Bot 命令（v5.2）」一节注册 Webhook 与命令菜单。
 7. 打开 Worker 地址，点「立即巡检」拉第一批数据；或 `curl -X POST https://<你的地址>/api/refresh`。
 
 ## 接口
@@ -93,14 +94,14 @@
 | `GET /api/repos` | 最新一批仓库 JSON（含 heat/grade/learnTags/verdict/starDelta），并附 `watchlist` 种子合并数据 |
 | `GET /api/watchlist` | 重点监控种子清单 JSON（含每条的分类、人工学习点与实时命中数据 `live`，未命中为 `null`） |
 | `GET /api/stats` | 最近一轮巡检元信息（时间、各通道条数、错误、改名事件 `renames`） |
-| `GET /api/brief` | 总统简报 JSON（与面板悬浮窗同一份数据：态势、飙升/热度 TOP3、网安/Skill 焦点、改名动态、关键词热度、话题趋势、重点监控动态），并附 `brief.push` 推送状态（两个 TG 目标的配置与今日结果） |
-| `POST /api/brief/push` | 手动推送总统简报到全部已配置 TG 目标（私聊 + 频道），6 小时节流；未配置返回 `status: "not_configured"` |
+| `GET /api/brief` | 总统简报 JSON（与面板悬浮窗同一份数据：态势、飙升/热度 TOP3、网安/Skill 焦点、改名动态、关键词热度、话题趋势、重点监控动态），并附 `brief.push` 推送状态（`configured: {dm, manualChannel, autoChannels}` 计数与今日各目标结果，不含频道标题/完整 id） |
+| `POST /api/brief/push` | 手动推送总统简报到全部 TG 目标（私聊 + 手动频道 + 自动注册频道），6 小时节流；未配置返回 `status: "not_configured"` |
 | `GET /api/tg/commands` | Bot 命令清单 JSON（`setMyCommands` 用，8 条） |
-| `POST /tg/webhook` | Telegram Webhook 入口（Bot 只读命令；需 Secret `TG_WEBHOOK_SECRET`，未配置返回 404、错密钥 403） |
+| `POST /tg/webhook` | Telegram Webhook 入口（Bot 只读命令 + 频道自动注册；需 Secret `TG_WEBHOOK_SECRET`，未配置返回 404、错密钥 403） |
 | `POST /api/refresh` | 手动触发巡检，30 分钟内重复调用会被节流（返回 `throttled: true`） |
 | Cron `scheduled()` | 定时巡检，不走手动节流 |
 
-KV 键：`intel:latest`（最新数据）、`intel:prev`（上轮星标快照，v4 起为 id 键格式）、`intel:meta`（巡检元信息）、`intel:seedids`（种子仓库 id 映射）、`intel:seedcursor`（种子保鲜轮换游标）、`intel:seedlive`（种子保鲜结果）、`intel:topichist`（话题趋势历史快照，最近 56 个）、`intel:briefpush`（简报每日推送状态，按目标分别记录）、`intel:pushmanual`（手动推送节流时间戳）。
+KV 键：`intel:latest`（最新数据）、`intel:prev`（上轮星标快照，v4 起为 id 键格式）、`intel:meta`（巡检元信息）、`intel:seedids`（种子仓库 id 映射）、`intel:seedcursor`（种子保鲜轮换游标）、`intel:seedlive`（种子保鲜结果）、`intel:topichist`（话题趋势历史快照，最近 56 个）、`intel:briefpush`（简报每日推送状态，v5.3 起为 `{date, targets}` 按目标键记录）、`intel:pushmanual`（手动推送节流时间戳）、`intel:tgchannels`（自动注册的频道表，v5.3 新增）。
 
 ## 数据诚实说明
 
@@ -117,4 +118,4 @@ KV 键：`intel:latest`（最新数据）、`intel:prev`（上轮星标快照，
 node --check worker.js
 ```
 
-本地 harness（Mock KV + Mock GitHub API）不在本目录：v2 实测 27/27 通过；v3 harness 断言 11 通道恰好 11 次请求、skills 通道修复后有数据入库、src-hunt 仓库的 XSS/PoC 标签、sec-learning 的学习路线标签、安全标签合并进 `/api/repos`、面板新分区/标签云/可点标签 chip（data-tag）/分页控件（data-page、上一页/下一页）与每页 24 条常量。v4 harness（`/tmp/intel-harness4.mjs`）27/27 通过：记录存 id、快照 id 键格式、同 id 改名后增量精确（+150）且 `renamedFrom`/`meta.renames` 正确、旧扁平快照迁移轮仍算出增量（+40）、种子 id 映射落盘且改名后按 id 命中并显示新名、面板折叠开关（data-collapse ≥10）/展开全部按钮/双分页控件/简报悬浮窗标记与内嵌 JSON 可解析、`/api/brief` 含 renames 与 topTopics、拖拽处理代码（brief-head 的 pointerdown）存在。v5 harness（`/tmp/intel-harness5.mjs`）53/53 通过：种子保鲜轮换（两轮游标 0→4→7、每轮恰好 3 个未命中种子、改名种子存当前名并回写 seedids、404 标记 gone、buildWatchlist 用 seedlive 星标）、话题趋势（topichist 追加与 56 上限裁剪、mcp 的 dStars24h/dCount24h/streak 精确）、TG 双目标推送（双目标各 1 条且 chat_id 正确、只配频道只发频道、按目标每日门禁：频道失败次轮只重试频道、08:00 前不推、次日恢复、手动推送全目标 + 6h 节流 + 与每日状态共用、无配置静默与 not_configured）、通道 403 重试成功且记入 retriedChannels、全局吸顶栈结构（stickyhead 顺序包含 topbar/标签行/筛选条、筛选条不在 sec-all 内、全部控件 id 恰好出现 1 次）。
+本地 harness（Mock KV + Mock GitHub API）不在本目录：v2 实测 27/27 通过；v3 harness 断言 11 通道恰好 11 次请求、skills 通道修复后有数据入库、src-hunt 仓库的 XSS/PoC 标签、sec-learning 的学习路线标签、安全标签合并进 `/api/repos`、面板新分区/标签云/可点标签 chip（data-tag）/分页控件（data-page、上一页/下一页）与每页 24 条常量。v4 harness（`/tmp/intel-harness4.mjs`）27/27 通过：记录存 id、快照 id 键格式、同 id 改名后增量精确（+150）且 `renamedFrom`/`meta.renames` 正确、旧扁平快照迁移轮仍算出增量（+40）、种子 id 映射落盘且改名后按 id 命中并显示新名、面板折叠开关（data-collapse ≥10）/展开全部按钮/双分页控件/简报悬浮窗标记与内嵌 JSON 可解析、`/api/brief` 含 renames 与 topTopics、拖拽处理代码（brief-head 的 pointerdown）存在。v5 harness（`/tmp/intel-harness5.mjs`）53/53 通过：种子保鲜轮换（两轮游标 0→4→7、每轮恰好 3 个未命中种子、改名种子存当前名并回写 seedids、404 标记 gone、buildWatchlist 用 seedlive 星标）、话题趋势（topichist 追加与 56 上限裁剪、mcp 的 dStars24h/dCount24h/streak 精确）、TG 双目标推送（双目标各 1 条且 chat_id 正确、只配频道只发频道、按目标每日门禁：频道失败次轮只重试频道、08:00 前不推、次日恢复、手动推送全目标 + 6h 节流 + 与每日状态共用、无配置静默与 not_configured）、通道 403 重试成功且记入 retriedChannels、全局吸顶栈结构（stickyhead 顺序包含 topbar/标签行/筛选条、筛选条不在 sec-all 内、全部控件 id 恰好出现 1 次）。v5.2 harness（`/tmp/intel-harness6.mjs`）37/37 通过：Webhook 密钥校验（未配置 404 / 错密钥 403）、8 条只读命令回复内容与目标 chat、非命令更新忽略、命令清单与空 KV 兜底。v5.3 harness（`/tmp/intel-harness7.mjs`）25/25 通过：频道自动注册（升管理员登记 active、他人/群聊事件忽略、错密钥不登记）、每日推送直达 DM + 自动频道且新格式落盘、channel_post 补登记、降级/移出标 removed 并停推、双频道齐发、手动频道与自动频道同 id 去重、旧格式 briefpush 迁移（已成功目标不重发、legacy 键不门禁自动频道）、`/api/brief` push 状态只给计数不带标题、`/stats` 频道标题仅机主可见；v5.3 落地后 v5 harness 中 5 处断言（B04/B06/C02/C04/D02）按新 `targets`/`manualChannel` 格式适配后仍 53/53，v5.2 harness 无需改动 37/37。
